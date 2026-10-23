@@ -260,4 +260,18 @@ public class DaemonSpawnerTests
             }
         }
     }
+
+    [Fact]
+    public void CreateProcessStartInfo_RedirectsAllStdioHandles()
+    {
+        var psi = DaemonSpawner.CreateProcessStartInfo("customExe", "coordinator --daemon");
+
+        Assert.Equal("customExe", psi.FileName);
+        Assert.Equal("coordinator --daemon", psi.Arguments);
+        Assert.False(psi.UseShellExecute);
+        Assert.True(psi.CreateNoWindow);
+        Assert.True(psi.RedirectStandardInput, "StandardInput must be redirected to cleanly detach from parent stdio.");
+        Assert.True(psi.RedirectStandardOutput, "StandardOutput must be redirected to cleanly detach from parent stdio.");
+        Assert.True(psi.RedirectStandardError, "StandardError must be redirected to cleanly detach from parent stdio.");
+    }
 }

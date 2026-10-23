@@ -25,11 +25,13 @@ public sealed class InMemoryLockEngine : ILockEngine, IDisposable
     private readonly Dictionary<string, ActiveLock> _locks = new();
     private readonly Dictionary<string, LinkedList<Waiter>> _waiters = new();
     private readonly TimeProvider _timeProvider;
+    private readonly Func<int, bool> _isPidDead;
     private bool _isDisposed;
 
-    public InMemoryLockEngine(TimeProvider? timeProvider = null)
+    public InMemoryLockEngine(TimeProvider? timeProvider = null, Func<int, bool>? isPidDead = null)
     {
         _timeProvider = timeProvider ?? TimeProvider.System;
+        _isPidDead = isPidDead ?? DefaultIsPidDead;
     }
 
     public ValueTask<LockResult> AcquireAsync(LockRequest request, CancellationToken cancellationToken = default)
@@ -46,16 +48,15 @@ public sealed class InMemoryLockEngine : ILockEngine, IDisposable
         {
             ThrowIfDisposed();
 
-            // Check if active lock is expired
-            if (_locks.TryGetValue(resource, out var activeLock))
+            // Check if active lock is expired or held by a dead process
+            ActiveLock? activeLock;
+            while (_locks.TryGetValue(resource, out activeLock) &&
+                   (IsExpired(activeLock.Record) || _isPidDead(activeLock.Record.OwnerPid)))
             {
-                if (IsExpired(activeLock.Record))
-                {
-                    EvictActiveLockInternal(resource, activeLock);
-                    PromoteNextWaiterInternal(resource);
-                    _locks.TryGetValue(resource, out activeLock);
-                }
+                EvictActiveLockInternal(resource, activeLock);
+                PromoteNextWaiterInternal(resource);
             }
+            _locks.TryGetValue(resource, out activeLock);
 
             var hasWaiters = _waiters.TryGetValue(resource, out var queue) && queue.Count > 0;
 
@@ -332,7 +333,7 @@ public sealed class InMemoryLockEngine : ILockEngine, IDisposable
         {
             ThrowIfDisposed();
 
-            if (!IsPidDead(pid))
+            if (!_isPidDead(pid))
             {
                 return ValueTask.FromResult(false);
             }
@@ -490,6 +491,22 @@ public sealed class InMemoryLockEngine : ILockEngine, IDisposable
                 continue;
             }
 
+            // Skip waiters whose process died while queued
+            if (_isPidDead(waiter.Request.OwnerPid))
+            {
+                waiter.IsCompleted = true;
+                waiter.CancellationReg.Unregister();
+                waiter.WaitTimeoutCts?.Dispose();
+                waiter.Tcs.TrySetResult(new LockResult(
+                    false,
+                    resource,
+                    null,
+                    null,
+                    "Process terminated while waiting.",
+                    null));
+                continue;
+            }
+
             waiter.IsCompleted = true;
             waiter.CancellationReg.Unregister();
             waiter.WaitTimeoutCts?.Dispose();
@@ -520,7 +537,9 @@ public sealed class InMemoryLockEngine : ILockEngine, IDisposable
             lock (_gate)
             {
                 if (_isDisposed) return;
-                if (_locks.TryGetValue(resource, out var current) && ReferenceEquals(current, activeLock))
+                if (_locks.TryGetValue(resource, out var current) && 
+                    ReferenceEquals(current, activeLock) && 
+                    ReferenceEquals(current.ExpirationCts, cts))
                 {
                     EvictActiveLockInternal(resource, current);
                     PromoteNextWaiterInternal(resource);
@@ -541,7 +560,7 @@ public sealed class InMemoryLockEngine : ILockEngine, IDisposable
         return record.ExpiresAt.HasValue && record.ExpiresAt.Value <= _timeProvider.GetUtcNow();
     }
 
-    private static bool IsPidDead(int pid)
+    private static bool DefaultIsPidDead(int pid)
     {
         if (pid <= 0) return true;
         try

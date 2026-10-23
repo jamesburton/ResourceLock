@@ -185,4 +185,31 @@ public class CoordinatorServerTests
 
         await server.StopAsync();
     }
+
+    [Fact]
+    public async Task CoordinatorServer_ConfigurableHost_BindsAndResponds()
+    {
+        var engine = new InMemoryLockEngine();
+        var pipeName = OperatingSystem.IsWindows()
+            ? "ResourceLock-Test-" + Guid.NewGuid()
+            : Path.Combine(Path.GetTempPath(), $"resourcelock-test-{Guid.NewGuid()}.sock");
+
+        // Explicitly test binding with 0.0.0.0 and port 0
+        await using var server = new CoordinatorServer(
+            engine,
+            httpPort: 0,
+            customPipeOrSocketName: pipeName,
+            httpHost: "0.0.0.0");
+
+        await server.StartAsync();
+
+        Assert.NotNull(server.HttpUri);
+        Assert.True(server.HttpPort > 0);
+
+        using var httpClient = new HttpClient { BaseAddress = server.HttpUri };
+        var ping = await httpClient.GetAsync("/api/ping");
+        Assert.True(ping.IsSuccessStatusCode);
+
+        await server.StopAsync();
+    }
 }

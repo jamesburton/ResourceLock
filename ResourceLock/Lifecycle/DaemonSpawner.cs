@@ -155,27 +155,31 @@ public static class DaemonSpawner
         }
     }
 
-    private static void SpawnCoordinatorProcess(string? coordinatorExecutable, string? coordinatorArgs)
+    internal static ProcessStartInfo CreateProcessStartInfo(string? coordinatorExecutable, string? coordinatorArgs)
     {
         var exe = coordinatorExecutable ?? Environment.ProcessPath ?? "ResourceLock";
         var args = coordinatorArgs ?? "coordinator --daemon";
 
-        var psi = new ProcessStartInfo
+        return new ProcessStartInfo
         {
             FileName = exe,
             Arguments = args,
             UseShellExecute = false,
             CreateNoWindow = true,
             WindowStyle = ProcessWindowStyle.Hidden,
-            RedirectStandardInput = false,
-            RedirectStandardOutput = false,
-            RedirectStandardError = false
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true
         };
+    }
 
+    private static void SpawnCoordinatorProcess(string? coordinatorExecutable, string? coordinatorArgs)
+    {
+        var psi = CreateProcessStartInfo(coordinatorExecutable, coordinatorArgs);
         var proc = Process.Start(psi);
         if (proc == null)
         {
-            throw new InvalidOperationException($"Failed to spawn coordinator daemon process '{exe} {args}'.");
+            throw new InvalidOperationException($"Failed to spawn coordinator daemon process '{psi.FileName} {psi.Arguments}'.");
         }
     }
 

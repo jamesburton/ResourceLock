@@ -25,6 +25,7 @@ public sealed class CoordinatorServer : IAsyncDisposable
     private readonly ILockEngine _lockEngine;
     private readonly IRemoteCoordinatorClient _remoteCoordinatorClient;
     private readonly int _httpPort;
+    private readonly string _httpHost;
     private readonly string _pipeOrSocketName;
     private readonly ConcurrentDictionary<Task, bool> _activeConnections = new();
 
@@ -38,11 +39,13 @@ public sealed class CoordinatorServer : IAsyncDisposable
         ILockEngine lockEngine,
         int httpPort = 51234,
         string? customPipeOrSocketName = null,
-        IRemoteCoordinatorClient? remoteCoordinatorClient = null)
+        IRemoteCoordinatorClient? remoteCoordinatorClient = null,
+        string httpHost = "0.0.0.0")
     {
         _lockEngine = lockEngine ?? throw new ArgumentNullException(nameof(lockEngine));
         _remoteCoordinatorClient = remoteCoordinatorClient ?? new RemoteCoordinatorClient();
         _httpPort = httpPort;
+        _httpHost = string.IsNullOrWhiteSpace(httpHost) ? "0.0.0.0" : httpHost;
 
         if (!string.IsNullOrWhiteSpace(customPipeOrSocketName))
         {
@@ -87,7 +90,7 @@ public sealed class CoordinatorServer : IAsyncDisposable
             var builder = WebApplication.CreateSlimBuilder();
             builder.Logging.ClearProviders();
 
-            builder.WebHost.UseUrls($"http://127.0.0.1:{_httpPort}");
+            builder.WebHost.UseUrls($"http://{_httpHost}:{_httpPort}");
 
             _app = builder.Build();
             _app.MapCoordinatorEndpoints(_lockEngine);
@@ -99,12 +102,15 @@ public sealed class CoordinatorServer : IAsyncDisposable
             if (address != null && Uri.TryCreate(address, UriKind.Absolute, out var uri))
             {
                 HttpPort = uri.Port;
-                HttpUri = uri;
+                // If bound to 0.0.0.0 or wildcard, normalize client access URI to 127.0.0.1 for local connection
+                var host = (uri.Host == "0.0.0.0" || uri.Host == "+" || uri.Host == "*") ? "127.0.0.1" : uri.Host;
+                HttpUri = new UriBuilder(uri) { Host = host }.Uri;
             }
             else if (_httpPort > 0)
             {
                 HttpPort = _httpPort;
-                HttpUri = new Uri($"http://127.0.0.1:{_httpPort}");
+                var host = (_httpHost == "0.0.0.0" || _httpHost == "+" || _httpHost == "*") ? "127.0.0.1" : _httpHost;
+                HttpUri = new Uri($"http://{host}:{_httpPort}");
             }
         }
     }
@@ -237,6 +243,16 @@ public sealed class CoordinatorServer : IAsyncDisposable
 
         using var serverSocket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
         serverSocket.Bind(new UnixDomainSocketEndPoint(socketPath));
+        if (!OperatingSystem.IsWindows())
+        {
+            try
+            {
+                File.SetUnixFileMode(socketPath, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+            }
+            catch
+            {
+            }
+        }
         serverSocket.Listen(128);
 
         try

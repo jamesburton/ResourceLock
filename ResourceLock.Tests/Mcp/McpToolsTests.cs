@@ -37,8 +37,9 @@ public class McpToolsTests
     public async Task Acquire_WhenContested_ReturnsFailure()
     {
         var engine = new InMemoryLockEngine();
-        var tools1 = new ResourceLockTools(engine, sessionId: "sess-1", ownerPid: 111);
-        var tools2 = new ResourceLockTools(engine, sessionId: "sess-2", ownerPid: 222);
+        var currentPid = Environment.ProcessId;
+        var tools1 = new ResourceLockTools(engine, sessionId: "sess-1", ownerPid: currentPid);
+        var tools2 = new ResourceLockTools(engine, sessionId: "sess-2", ownerPid: currentPid);
 
         var r1 = await tools1.AcquireLockAsync("GPU", wait_seconds: 0, reason: "Session 1 training");
         Assert.True(r1.Success);

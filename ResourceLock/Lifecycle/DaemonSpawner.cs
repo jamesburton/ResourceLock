@@ -49,27 +49,30 @@ public static class DaemonSpawner
 
             // Spawn detached background daemon process
             SpawnCoordinatorProcess(coordinatorExecutable, coordinatorArgs);
-        }
 
-        // 3. Poll IPC connection with exponential backoff until connected
-        var delayMs = 25;
-        var maxDelayMs = 250;
-        var totalTimeout = TimeSpan.FromSeconds(5);
-        var sw = Stopwatch.StartNew();
+            // 3. Poll IPC connection with exponential backoff while holding spawn lock
+            // This guarantees waiting callers only acquire the lock after the coordinator
+            // is listening, preventing duplicate spawn races during cold-start.
+            var delayMs = 25;
+            var maxDelayMs = 250;
+            var totalTimeout = TimeSpan.FromSeconds(5);
+            var sw = Stopwatch.StartNew();
 
-        while (!cancellationToken.IsCancellationRequested && sw.Elapsed < totalTimeout)
-        {
-            stream = await TryConnectAsync(endpoint, timeoutMs: 100, cancellationToken).ConfigureAwait(false);
-            if (stream != null)
+            while (!cancellationToken.IsCancellationRequested && sw.Elapsed < totalTimeout)
             {
-                return stream;
+                stream = await TryConnectAsync(endpoint, timeoutMs: 100, cancellationToken).ConfigureAwait(false);
+                if (stream != null)
+                {
+                    return stream;
+                }
+
+                await Task.Delay(delayMs, cancellationToken).ConfigureAwait(false);
+                delayMs = Math.Min(delayMs * 2, maxDelayMs);
             }
 
-            await Task.Delay(delayMs, cancellationToken).ConfigureAwait(false);
-            delayMs = Math.Min(delayMs * 2, maxDelayMs);
+            cancellationToken.ThrowIfCancellationRequested();
+            throw new TimeoutException($"Failed to connect to coordinator daemon at '{endpoint}' within {totalTimeout.TotalSeconds} seconds.");
         }
-
-        throw new TimeoutException($"Failed to connect to coordinator daemon at '{endpoint}' within {totalTimeout.TotalSeconds} seconds.");
     }
 
     public static string GetSpawnLockPath()
@@ -113,6 +116,7 @@ public static class DaemonSpawner
             }
         }
 
+        cancellationToken.ThrowIfCancellationRequested();
         throw new TimeoutException($"Timed out acquiring spawn lock at '{path}' after {timeout.TotalSeconds} seconds.");
     }
 

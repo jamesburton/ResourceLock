@@ -66,7 +66,7 @@ public static class ExitCleanupHook
         {
             try
             {
-                return cb();
+                return cb() ?? Task.CompletedTask;
             }
             catch
             {

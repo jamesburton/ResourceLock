@@ -178,4 +178,86 @@ public class DaemonSpawnerTests
             }
         }
     }
+
+    [Fact]
+    public void ExitCleanupHook_HandlesNullTaskCallbackGracefully()
+    {
+        ExitCleanupHook.ResetForTesting();
+
+        ExitCleanupHook.Register(() => null!);
+        var exception = Record.Exception(() => ExitCleanupHook.ExecuteCleanup());
+        Assert.Null(exception);
+    }
+
+    [Fact]
+    public async Task AcquireSpawnLockAsync_ThrowsOperationCanceledException_WhenCancelled()
+    {
+        var tempLockFile = Path.Combine(Path.GetTempPath(), $"spawn_lock_cancel_{Guid.NewGuid():N}.lock");
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
+        {
+            await DaemonSpawner.AcquireSpawnLockAsync(tempLockFile, TimeSpan.FromSeconds(5), cts.Token);
+        });
+    }
+
+    [Fact]
+    public async Task DaemonSpawner_ColdStartConcurrency_HoldingLockSynchronizesCallers()
+    {
+        var pipeOrSocketName = OperatingSystem.IsWindows()
+            ? $"TestPipe_DaemonSpawner_ColdStart_{Guid.NewGuid():N}"
+            : Path.Combine(Path.GetTempPath(), $"test_spawner_coldstart_{Guid.NewGuid():N}.sock");
+
+        var tempLockFile = Path.Combine(Path.GetTempPath(), $"spawn_lock_coldstart_{Guid.NewGuid():N}.lock");
+
+        var engine = new InMemoryLockEngine();
+        await using var server = new CoordinatorServer(engine, httpPort: -1, customPipeOrSocketName: pipeOrSocketName);
+
+        // Start server with 150ms delay to simulate daemon process cold-start startup delay
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(150);
+            await server.StartAsync();
+        });
+
+        try
+        {
+            // Callers race to connect before server is listening
+            var task1 = DaemonSpawner.EnsureCoordinatorAndConnectAsync(
+                pipeOrSocketName: pipeOrSocketName,
+                spawnLockPath: tempLockFile,
+                coordinatorExecutable: "dotnet",
+                coordinatorArgs: "--version", // no-op dummy executable that exits immediately
+                cancellationToken: CancellationToken.None);
+
+            var task2 = DaemonSpawner.EnsureCoordinatorAndConnectAsync(
+                pipeOrSocketName: pipeOrSocketName,
+                spawnLockPath: tempLockFile,
+                coordinatorExecutable: "dotnet",
+                coordinatorArgs: "--version",
+                cancellationToken: CancellationToken.None);
+
+            var streams = await Task.WhenAll(task1, task2);
+            Assert.Equal(2, streams.Length);
+
+            foreach (var stream in streams)
+            {
+                Assert.NotNull(stream);
+                var ping = new IpcEnvelope("sync-ping", IpcMessageType.Ping);
+                await IpcFrameCodec.WriteFrameAsync(stream, ping);
+                var pong = await IpcFrameCodec.ReadFrameAsync(stream);
+                Assert.NotNull(pong);
+                Assert.Equal("sync-ping", pong.MessageId);
+                await stream.DisposeAsync();
+            }
+        }
+        finally
+        {
+            if (File.Exists(tempLockFile))
+            {
+                try { File.Delete(tempLockFile); } catch { }
+            }
+        }
+    }
 }

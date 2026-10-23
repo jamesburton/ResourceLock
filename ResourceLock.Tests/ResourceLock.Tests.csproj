@@ -20,6 +20,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\ResourceLock.Core\ResourceLock.Core.csproj" />
+    <ProjectReference Include="..\ResourceLock.Coordinator\ResourceLock.Coordinator.csproj" />
   </ItemGroup>
 
 </Project>

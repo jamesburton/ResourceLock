@@ -5,6 +5,19 @@
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <PackAsTool>true</PackAsTool>
+    <ToolCommandName>ResourceLock</ToolCommandName>
+    <PackageId>ResourceLock</PackageId>
+    <Title>ResourceLock</Title>
+    <Version>0.1.0</Version>
+    <Authors>James Burton</Authors>
+    <Description>Distributed and local hardware resource locking MCP server for AI agents.</Description>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/jamesburton/ResourceLock</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/jamesburton/ResourceLock</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageTags>mcp;ai;lock;concurrency;resource-management;distributed-locking</PackageTags>
   </PropertyGroup>
 
   <ItemGroup>
@@ -18,6 +31,10 @@
 
   <ItemGroup>
     <PackageReference Include="Microsoft.Extensions.AI" Version="10.11.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="..\README.md" Pack="true" PackagePath="\" />
   </ItemGroup>
 
 </Project>

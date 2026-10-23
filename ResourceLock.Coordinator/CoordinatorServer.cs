@@ -15,6 +15,7 @@ using Microsoft.AspNetCore.Hosting.Server;
 using Microsoft.AspNetCore.Hosting.Server.Features;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using ResourceLock.Coordinator.Federation;
 using ResourceLock.Coordinator.Transports;
 using ResourceLock.Core.Engine;
 using ResourceLock.Core.Ipc;
@@ -22,6 +23,7 @@ using ResourceLock.Core.Ipc;
 public sealed class CoordinatorServer : IAsyncDisposable
 {
     private readonly ILockEngine _lockEngine;
+    private readonly IRemoteCoordinatorClient _remoteCoordinatorClient;
     private readonly int _httpPort;
     private readonly string _pipeOrSocketName;
     private readonly ConcurrentDictionary<Task, bool> _activeConnections = new();
@@ -32,9 +34,14 @@ public sealed class CoordinatorServer : IAsyncDisposable
     private int _started;
     private int _stopped;
 
-    public CoordinatorServer(ILockEngine lockEngine, int httpPort = 51234, string? customPipeOrSocketName = null)
+    public CoordinatorServer(
+        ILockEngine lockEngine,
+        int httpPort = 51234,
+        string? customPipeOrSocketName = null,
+        IRemoteCoordinatorClient? remoteCoordinatorClient = null)
     {
         _lockEngine = lockEngine ?? throw new ArgumentNullException(nameof(lockEngine));
+        _remoteCoordinatorClient = remoteCoordinatorClient ?? new RemoteCoordinatorClient();
         _httpPort = httpPort;
 
         if (!string.IsNullOrWhiteSpace(customPipeOrSocketName))
@@ -181,7 +188,7 @@ public sealed class CoordinatorServer : IAsyncDisposable
                     {
                         await using (stream.ConfigureAwait(false))
                         {
-                            var handler = new IpcConnectionHandler(_lockEngine);
+                            var handler = new IpcConnectionHandler(_lockEngine, _remoteCoordinatorClient);
                             await handler.HandleAsync(stream, cancellationToken).ConfigureAwait(false);
                         }
                     }
@@ -253,7 +260,7 @@ public sealed class CoordinatorServer : IAsyncDisposable
                         using (clientSocket)
                         await using (var stream = new NetworkStream(clientSocket, ownsSocket: false))
                         {
-                            var handler = new IpcConnectionHandler(_lockEngine);
+                            var handler = new IpcConnectionHandler(_lockEngine, _remoteCoordinatorClient);
                             await handler.HandleAsync(stream, cancellationToken).ConfigureAwait(false);
                         }
                     }
@@ -289,6 +296,10 @@ public sealed class CoordinatorServer : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         await StopAsync().ConfigureAwait(false);
+        if (_remoteCoordinatorClient is IDisposable disposableClient)
+        {
+            disposableClient.Dispose();
+        }
         _cts?.Dispose();
     }
 }

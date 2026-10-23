@@ -3,20 +3,26 @@ namespace ResourceLock.Coordinator.Transports;
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using ResourceLock.Coordinator.Federation;
 using ResourceLock.Core.Engine;
 using ResourceLock.Core.Ipc;
 using ResourceLock.Core.Models;
 
+public readonly record struct RemoteLockKey(string Host, string Resource, string SessionId);
+
 public sealed class IpcConnectionHandler
 {
     private readonly ILockEngine _lockEngine;
+    private readonly IRemoteCoordinatorClient _remoteCoordinatorClient;
 
-    public IpcConnectionHandler(ILockEngine lockEngine)
+    public IpcConnectionHandler(ILockEngine lockEngine, IRemoteCoordinatorClient? remoteCoordinatorClient = null)
     {
         _lockEngine = lockEngine ?? throw new ArgumentNullException(nameof(lockEngine));
+        _remoteCoordinatorClient = remoteCoordinatorClient ?? new RemoteCoordinatorClient();
     }
 
     private sealed class ConnectionContext
@@ -24,6 +30,7 @@ public sealed class IpcConnectionHandler
         public HashSet<string> SessionIds { get; } = new(StringComparer.Ordinal);
         public string? DefaultSessionId { get; set; }
         public int? DefaultPid { get; set; }
+        public HashSet<RemoteLockKey> RemoteLocks { get; } = new();
     }
 
     public async Task HandleAsync(Stream stream, CancellationToken cancellationToken = default)
@@ -85,6 +92,23 @@ public sealed class IpcConnectionHandler
                     // Ignore exceptions during disconnect cleanup
                 }
             }
+
+            foreach (var remoteLock in context.RemoteLocks)
+            {
+                try
+                {
+                    await _remoteCoordinatorClient.ForwardReleaseAsync(
+                        remoteLock.Host,
+                        remoteLock.Resource,
+                        remoteLock.SessionId,
+                        CancellationToken.None).ConfigureAwait(false);
+                }
+                catch
+                {
+                    // Ignore exceptions during disconnect cleanup
+                }
+            }
+            context.RemoteLocks.Clear();
         }
     }
 
@@ -140,7 +164,21 @@ public sealed class IpcConnectionHandler
                 context.DefaultSessionId ??= request.SessionId;
                 context.DefaultPid ??= request.OwnerPid;
 
-                var result = await _lockEngine.AcquireAsync(request, cancellationToken).ConfigureAwait(false);
+                var parsed = RemoteResourceParser.Parse(request.Resource);
+                LockResult result;
+                if (parsed.Host != null)
+                {
+                    result = await _remoteCoordinatorClient.ForwardAcquireAsync(parsed.Host, request, cancellationToken).ConfigureAwait(false);
+                    if (result.Success)
+                    {
+                        context.RemoteLocks.Add(new RemoteLockKey(parsed.Host, parsed.Resource, request.SessionId));
+                    }
+                }
+                else
+                {
+                    result = await _lockEngine.AcquireAsync(request, cancellationToken).ConfigureAwait(false);
+                }
+
                 var resp = new IpcEnvelope(
                     envelope.MessageId,
                     IpcMessageType.Response,
@@ -175,7 +213,21 @@ public sealed class IpcConnectionHandler
                     return;
                 }
 
-                var result = await _lockEngine.ReleaseAsync(resource, sessionId ?? "", cancellationToken).ConfigureAwait(false);
+                var parsed = RemoteResourceParser.Parse(resource);
+                LockResult result;
+                if (parsed.Host != null)
+                {
+                    result = await _remoteCoordinatorClient.ForwardReleaseAsync(parsed.Host, parsed.Resource, sessionId ?? "", cancellationToken).ConfigureAwait(false);
+                    if (result.Success)
+                    {
+                        context.RemoteLocks.Remove(new RemoteLockKey(parsed.Host, parsed.Resource, sessionId ?? ""));
+                    }
+                }
+                else
+                {
+                    result = await _lockEngine.ReleaseAsync(resource, sessionId ?? "", cancellationToken).ConfigureAwait(false);
+                }
+
                 var resp = new IpcEnvelope(
                     envelope.MessageId,
                     IpcMessageType.Response,
@@ -200,6 +252,29 @@ public sealed class IpcConnectionHandler
                 if (!string.IsNullOrEmpty(sessionId))
                 {
                     count = await _lockEngine.ReleaseAllForSessionAsync(sessionId, cancellationToken).ConfigureAwait(false);
+
+                    var sessionRemoteLocks = context.RemoteLocks.Where(l => l.SessionId == sessionId).ToList();
+                    foreach (var remoteLock in sessionRemoteLocks)
+                    {
+                        try
+                        {
+                            var releaseResult = await _remoteCoordinatorClient.ForwardReleaseAsync(
+                                remoteLock.Host,
+                                remoteLock.Resource,
+                                remoteLock.SessionId,
+                                cancellationToken).ConfigureAwait(false);
+
+                            if (releaseResult.Success)
+                            {
+                                count++;
+                                context.RemoteLocks.Remove(remoteLock);
+                            }
+                        }
+                        catch
+                        {
+                            // Ignore exceptions during cleanup
+                        }
+                    }
                 }
 
                 var resp = new IpcEnvelope(

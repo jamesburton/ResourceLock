@@ -189,4 +189,122 @@ public class InMemoryLockEngineTests
         var releaseResult = await engine.ReleaseAsync(" STRIX:gpu ", "sess-1");
         Assert.True(releaseResult.Success);
     }
+
+    [Fact]
+    public async Task Release_WithTimeout_MultipleWaiters_PromotesOnlyFirstWaiter()
+    {
+        var engine = new InMemoryLockEngine();
+        await engine.AcquireAsync(new LockRequest("gpu", "sess-holder", 100, TimeoutSeconds: 60));
+
+        var waiter1Task = engine.AcquireAsync(new LockRequest("gpu", "sess-waiter1", 101, WaitSeconds: 5));
+        var waiter2Task = engine.AcquireAsync(new LockRequest("gpu", "sess-waiter2", 102, WaitSeconds: 5));
+
+        var releaseResult = await engine.ReleaseAsync("gpu", "sess-holder");
+        Assert.True(releaseResult.Success);
+
+        var res1 = await waiter1Task;
+        Assert.True(res1.Success);
+        Assert.Equal("sess-waiter1", res1.SessionId);
+
+        Assert.False(waiter2Task.IsCompleted);
+
+        var locks = await engine.ListLocksAsync();
+        Assert.Single(locks);
+        Assert.Equal("sess-waiter1", locks[0].SessionId);
+    }
+
+    [Fact]
+    public async Task Renewal_OfExpiringLock_DoesNotTriggerPrematurePromotion()
+    {
+        var engine = new InMemoryLockEngine();
+        await engine.AcquireAsync(new LockRequest("gpu", "sess-holder", 100, TimeoutSeconds: 60));
+
+        var waiterTask = engine.AcquireAsync(new LockRequest("gpu", "sess-waiter", 200, WaitSeconds: 5));
+        Assert.False(waiterTask.IsCompleted);
+
+        var renewResult = await engine.AcquireAsync(new LockRequest("gpu", "sess-holder", 100, TimeoutSeconds: 120));
+        Assert.True(renewResult.Success);
+
+        Assert.False(waiterTask.IsCompleted);
+
+        var locks = await engine.ListLocksAsync();
+        Assert.Single(locks);
+        Assert.Equal("sess-holder", locks[0].SessionId);
+    }
+
+    [Fact]
+    public async Task LazyExpiration_InAcquireAsync_PromotesHeadWaiter()
+    {
+        var timeProvider = new ManualTimeProvider();
+        var engine = new InMemoryLockEngine(timeProvider);
+
+        await engine.AcquireAsync(new LockRequest("gpu", "sess-holder", 100, TimeoutSeconds: 5));
+
+        var waiterTask = engine.AcquireAsync(new LockRequest("gpu", "sess-waiter", 200, WaitSeconds: 30));
+        Assert.False(waiterTask.IsCompleted);
+
+        // Advance time past the 5 second timeout
+        timeProvider.Advance(TimeSpan.FromSeconds(10));
+
+        // Third session attempts immediate acquisition
+        var session3Result = await engine.AcquireAsync(new LockRequest("gpu", "sess-3", 300, WaitSeconds: 0));
+
+        // Head waiter should have been promoted
+        var waiterResult = await waiterTask;
+        Assert.True(waiterResult.Success);
+        Assert.Equal("sess-waiter", waiterResult.SessionId);
+
+        // Session 3 should see contention with the promoted waiter
+        Assert.False(session3Result.Success);
+        Assert.NotNull(session3Result.CurrentHolder);
+        Assert.Equal("sess-waiter", session3Result.CurrentHolder.SessionId);
+    }
+
+    [Fact]
+    public async Task CallerCancellation_RemovesWaiterAndCleansUp()
+    {
+        var engine = new InMemoryLockEngine();
+        await engine.AcquireAsync(new LockRequest("gpu", "sess-holder", 100));
+
+        using var cts = new CancellationTokenSource();
+        var waiterTask = engine.AcquireAsync(new LockRequest("gpu", "sess-waiter", 200, WaitSeconds: 30), cts.Token);
+
+        Assert.False(waiterTask.IsCompleted);
+
+        cts.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () => await waiterTask);
+
+        var releaseResult = await engine.ReleaseAsync("gpu", "sess-holder");
+        Assert.True(releaseResult.Success);
+
+        var locks = await engine.ListLocksAsync();
+        Assert.Empty(locks);
+    }
+
+    [Fact]
+    public async Task Dispose_CleansUpActiveLocksAndWaiters()
+    {
+        var engine = new InMemoryLockEngine();
+        await engine.AcquireAsync(new LockRequest("gpu", "sess-holder", 100, TimeoutSeconds: 60));
+        var waiterTask = engine.AcquireAsync(new LockRequest("gpu", "sess-waiter", 200, WaitSeconds: 30));
+
+        engine.Dispose();
+
+        var waiterResult = await waiterTask;
+        Assert.False(waiterResult.Success);
+        Assert.Contains("disposed", waiterResult.Message, StringComparison.OrdinalIgnoreCase);
+
+        await Assert.ThrowsAsync<ObjectDisposedException>(async () =>
+            await engine.AcquireAsync(new LockRequest("gpu", "sess-new", 300)));
+    }
+
+    private sealed class ManualTimeProvider : TimeProvider
+    {
+        private DateTimeOffset _utcNow = new(2026, 10, 23, 12, 0, 0, TimeSpan.Zero);
+
+        public override DateTimeOffset GetUtcNow() => _utcNow;
+
+        public void Advance(TimeSpan delta) => _utcNow = _utcNow.Add(delta);
+    }
 }

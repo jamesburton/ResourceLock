@@ -52,7 +52,8 @@ public sealed class InMemoryLockEngine : ILockEngine, IDisposable
                 if (IsExpired(activeLock.Record))
                 {
                     EvictActiveLockInternal(resource, activeLock);
-                    activeLock = null;
+                    PromoteNextWaiterInternal(resource);
+                    _locks.TryGetValue(resource, out activeLock);
                 }
             }
 
@@ -68,8 +69,8 @@ public sealed class InMemoryLockEngine : ILockEngine, IDisposable
             // If lock held by same session, allow re-entrancy / update
             if (activeLock != null && activeLock.Record.SessionId == request.SessionId)
             {
-                activeLock.ExpirationCts?.Cancel();
                 activeLock.ExpirationCts?.Dispose();
+                activeLock.ExpirationCts = null;
 
                 var now = _timeProvider.GetUtcNow();
                 DateTimeOffset? expiresAt = request.TimeoutSeconds is > 0
@@ -165,7 +166,7 @@ public sealed class InMemoryLockEngine : ILockEngine, IDisposable
                         waiter.IsCompleted = true;
                         queue.Remove(node);
                         if (queue.Count == 0) _waiters.Remove(resource);
-                        waiter.WaitTimeoutCts?.Cancel();
+                        waiter.WaitTimeoutCts?.Dispose();
 
                         waiter.Tcs.TrySetCanceled(cancellationToken);
                     }
@@ -266,7 +267,7 @@ public sealed class InMemoryLockEngine : ILockEngine, IDisposable
                         {
                             waiter.IsCompleted = true;
                             waiter.CancellationReg.Unregister();
-                            waiter.WaitTimeoutCts?.Cancel();
+                            waiter.WaitTimeoutCts?.Dispose();
                             waiter.Tcs.TrySetResult(new LockResult(
                                 false,
                                 res,
@@ -372,7 +373,7 @@ public sealed class InMemoryLockEngine : ILockEngine, IDisposable
                         {
                             waiter.IsCompleted = true;
                             waiter.CancellationReg.Unregister();
-                            waiter.WaitTimeoutCts?.Cancel();
+                            waiter.WaitTimeoutCts?.Dispose();
                             waiter.Tcs.TrySetResult(new LockResult(
                                 false,
                                 res,
@@ -411,8 +412,8 @@ public sealed class InMemoryLockEngine : ILockEngine, IDisposable
 
             foreach (var al in _locks.Values)
             {
-                al.ExpirationCts?.Cancel();
                 al.ExpirationCts?.Dispose();
+                al.ExpirationCts = null;
             }
             _locks.Clear();
 
@@ -424,7 +425,7 @@ public sealed class InMemoryLockEngine : ILockEngine, IDisposable
                     {
                         waiter.IsCompleted = true;
                         waiter.CancellationReg.Unregister();
-                        waiter.WaitTimeoutCts?.Cancel();
+                        waiter.WaitTimeoutCts?.Dispose();
                         waiter.Tcs.TrySetResult(new LockResult(
                             false,
                             waiter.Request.Resource,
@@ -491,7 +492,7 @@ public sealed class InMemoryLockEngine : ILockEngine, IDisposable
 
             waiter.IsCompleted = true;
             waiter.CancellationReg.Unregister();
-            waiter.WaitTimeoutCts?.Cancel();
+            waiter.WaitTimeoutCts?.Dispose();
 
             var result = GrantLockInternal(waiter.Request, resource);
             waiter.Tcs.TrySetResult(result);
@@ -530,10 +531,9 @@ public sealed class InMemoryLockEngine : ILockEngine, IDisposable
 
     private void EvictActiveLockInternal(string resource, ActiveLock activeLock)
     {
-        activeLock.ExpirationCts?.Cancel();
+        _locks.Remove(resource);
         activeLock.ExpirationCts?.Dispose();
         activeLock.ExpirationCts = null;
-        _locks.Remove(resource);
     }
 
     private bool IsExpired(LockRecord record)

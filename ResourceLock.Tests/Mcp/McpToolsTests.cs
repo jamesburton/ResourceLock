@@ -185,7 +185,7 @@ public class McpToolsTests
     [Fact]
     public async Task IpcLockEngine_EndToEndWithCoordinator()
     {
-        var pipeName = "test-mcp-pipe-" + Guid.NewGuid().ToString("N");
+        var pipeName = OperatingSystem.IsWindows() ? "test-mcp-pipe-" + Guid.NewGuid().ToString("N") : Path.Combine(Path.GetTempPath(), $"rl-mcp-{Guid.NewGuid():N}.sock");
         var engine = new InMemoryLockEngine();
         await using var server = new CoordinatorServer(engine, httpPort: -1, customPipeOrSocketName: pipeName);
         await server.StartAsync();

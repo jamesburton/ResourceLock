@@ -18,18 +18,12 @@ public class CoordinatorServerTests
 {
     private static async Task<Stream> ConnectClientAsync(string pipeOrSocketName)
     {
-        if (OperatingSystem.IsWindows())
+        var stream = await ResourceLock.Lifecycle.DaemonSpawner.TryConnectAsync(pipeOrSocketName, 5000, CancellationToken.None);
+        if (stream == null)
         {
-            var clientStream = new NamedPipeClientStream(".", pipeOrSocketName, PipeDirection.InOut, PipeOptions.Asynchronous);
-            await clientStream.ConnectAsync(5000);
-            return clientStream;
+            throw new TimeoutException($"Failed to connect to IPC endpoint: {pipeOrSocketName}");
         }
-        else
-        {
-            var socket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
-            await socket.ConnectAsync(new UnixDomainSocketEndPoint(pipeOrSocketName));
-            return new NetworkStream(socket, ownsSocket: true);
-        }
+        return stream;
     }
 
     [Fact]

@@ -138,20 +138,37 @@ public static class DaemonSpawner
         }
         else
         {
-            var socket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
-            try
+            var sw = Stopwatch.StartNew();
+            var delay = 25;
+            while (!cancellationToken.IsCancellationRequested)
             {
-                var socketEndPoint = new UnixDomainSocketEndPoint(endpoint);
-                using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-                cts.CancelAfter(timeoutMs);
-                await socket.ConnectAsync(socketEndPoint, cts.Token).ConfigureAwait(false);
-                return new NetworkStream(socket, ownsSocket: true);
+                var socket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
+                try
+                {
+                    var socketEndPoint = new UnixDomainSocketEndPoint(endpoint);
+                    var remaining = timeoutMs - (int)sw.ElapsedMilliseconds;
+                    if (remaining <= 0 && sw.ElapsedMilliseconds > 0)
+                    {
+                        socket.Dispose();
+                        break;
+                    }
+                    using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                    cts.CancelAfter(Math.Min(250, Math.Max(10, remaining)));
+                    await socket.ConnectAsync(socketEndPoint, cts.Token).ConfigureAwait(false);
+                    return new NetworkStream(socket, ownsSocket: true);
+                }
+                catch
+                {
+                    socket.Dispose();
+                    if (sw.ElapsedMilliseconds >= timeoutMs)
+                    {
+                        break;
+                    }
+                    await Task.Delay(Math.Min(delay, Math.Max(1, timeoutMs - (int)sw.ElapsedMilliseconds)), cancellationToken).ConfigureAwait(false);
+                    delay = Math.Min(delay * 2, 200);
+                }
             }
-            catch
-            {
-                socket.Dispose();
-                return null;
-            }
+            return null;
         }
     }
 

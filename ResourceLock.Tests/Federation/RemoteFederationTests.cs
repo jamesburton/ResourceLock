@@ -392,13 +392,15 @@ public class RemoteFederationTests
         // Start Local Coordinator (Coordinator A) forwarding to Coordinator B
         var engineA = new InMemoryLockEngine();
         var remoteClient = new RemoteCoordinatorClient(defaultPort: remotePort);
-        var pipeNameA = "ResourceLock-FedA-" + Guid.NewGuid();
+        var pipeNameA = OperatingSystem.IsWindows()
+            ? "ResourceLock-FedA-" + Guid.NewGuid()
+            : Path.Combine(Path.GetTempPath(), $"rl-feda-{Guid.NewGuid():N}.sock");
         await using var serverA = new CoordinatorServer(engineA, httpPort: -1, customPipeOrSocketName: pipeNameA, remoteCoordinatorClient: remoteClient);
         await serverA.StartAsync();
 
-        // Connect client to Local Coordinator A over NamedPipe
-        using var clientStream = new NamedPipeClientStream(".", pipeNameA, PipeDirection.InOut, PipeOptions.Asynchronous);
-        await clientStream.ConnectAsync(5000);
+        // Connect client to Local Coordinator A over cross-platform IPC
+        var clientStream = await ResourceLock.Lifecycle.DaemonSpawner.TryConnectAsync(pipeNameA, 5000, CancellationToken.None);
+        Assert.NotNull(clientStream);
 
         // Register session on Coordinator A
         var regEnvelope = new IpcEnvelope("msg-reg", IpcMessageType.RegisterSession, JsonSerializer.Serialize(new SessionInfo("sess-fed", 1234, DateTimeOffset.UtcNow), IpcFrameCodec.DefaultJsonOptions));

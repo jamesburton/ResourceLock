@@ -28,6 +28,7 @@ public sealed class CoordinatorServer : IAsyncDisposable
     private readonly string _httpHost;
     private readonly string _pipeOrSocketName;
     private readonly ConcurrentDictionary<Task, bool> _activeConnections = new();
+    private readonly TaskCompletionSource _ipcReadyTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     private CancellationTokenSource? _cts;
     private Task? _ipcLoopTask;
@@ -83,6 +84,8 @@ public sealed class CoordinatorServer : IAsyncDisposable
         {
             _ipcLoopTask = Task.Run(() => RunUnixSocketLoopAsync(_pipeOrSocketName, _cts.Token));
         }
+
+        await _ipcReadyTcs.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
 
         // 2. Start HTTP listener if enabled
         if (_httpPort >= 0)
@@ -173,6 +176,7 @@ public sealed class CoordinatorServer : IAsyncDisposable
 
     private async Task RunNamedPipeLoopAsync(string pipeName, CancellationToken cancellationToken)
     {
+        _ipcReadyTcs.TrySetResult();
         while (!cancellationToken.IsCancellationRequested)
         {
             NamedPipeServerStream? serverStream = null;
@@ -254,6 +258,7 @@ public sealed class CoordinatorServer : IAsyncDisposable
             }
         }
         serverSocket.Listen(128);
+        _ipcReadyTcs.TrySetResult();
 
         try
         {

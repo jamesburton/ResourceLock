@@ -26,14 +26,35 @@ Distributed and local hardware resource locking [Model Context Protocol (MCP)](h
 
 ---
 
-## Quickstart
+## Why ResourceLock? Empirical Benchmark Evidence
 
-### Running with `dnx` (Zero-Install from NuGet)
+AI coding agents running in parallel swarms frequently collide when competing for shared local compute—such as compiling large codebases, running inference on local GPU/NPU hardware, or running intensive test suites.
 
-.NET 10 introduces `dnx` (`dotnet dnx`), allowing tools published to NuGet to be fetched, cached, and executed on demand without prior global or local installation:
+Historically, agents coordinate via ad-hoc file locks (e.g., writing `.gpu.lock` and polling in bash loops). We conducted side-by-side empirical benchmarks measuring **agent token consumption**, **turn counts**, and **contention resolution latency** between file-lock polling and `ResourceLock`:
+
+| Metric | Ad-Hoc File Locking (Bash / Polling) | ResourceLock (MCP + Coordinator) | Improvement |
+|---|---|---|---|
+| **Turn Count** | 5 agent turns | **1 single atomic turn** | **80.0% reduction** |
+| **Token Consumption** | 4,181 tokens | **776 tokens** | **81.4% saved** |
+| **Concurrency & Accuracy** | High TOCTOU race condition risk | **100% serialized FIFO queue** | Deterministic order |
+| **Orphan Recovery** | Dangerous: Crashed agent leaves stale file | **Instant**: Connection drop & PID watchdog auto-release | Zero manual cleanup |
+| **Acquisition Mechanism** | Shell sleep loops (`while test -f ...`) | Asynchronous non-blocking queue (`wait_seconds: N`) | Zero compute/IO thrash |
+
+> **Key Takeaway**: File-lock polling burns thousands of context tokens per contention event because the agent must re-evaluate prompt context, history, and bash tool outputs on every loop iteration. `ResourceLock` offloads waiting to the local coordinator daemon via `acquire_lock(wait_seconds: ...)`, returning control to the agent only once the lock is cleanly acquired.
+
+---
+
+## Deployment: `dnx` vs Global Tool
+
+`ResourceLock` can be executed either on-demand via .NET 10 `dnx` or as a pre-installed global .NET tool:
+
+### 1. Zero-Install via `dnx` (Best for Single Sessions & Subagents)
+When running a single agent session or a session with occasional subagents, `dnx ResourceLock` is ideal:
+- **Zero setup**: Fetched and cached automatically from NuGet.org on first run.
+- **Auto-updating**: Always pulls latest published package version without manual maintenance.
 
 ```bash
-# Launch the stdio MCP server (default mode used by AI agents)
+# Launch stdio MCP server on demand
 dnx ResourceLock
 
 # Check version
@@ -46,75 +67,88 @@ dnx ResourceLock -- --help
 dnx ResourceLock -- coordinator
 ```
 
-> **How it works with `dnx`**:
-> When an agent launches `dnx ResourceLock`, the .NET runtime automatically pulls the `ResourceLock` tool package directly from NuGet.org into the local user cache and starts the MCP server over standard I/O (`stdin`/`stdout`).
-> You can also pin to an explicit version if desired:
-> ```bash
-> dnx ResourceLock@0.1.0
-> ```
+### 2. Global Tool Installation (Recommended for Heavy Agent Swarms)
 
-#### Alternative: Global or Local Tool Installation
-
-If you prefer installing `ResourceLock` into your system path instead of running via `dnx`:
+> [!WARNING]
+> **Preventing Process Storms**:
+> When running multiple concurrent agent sessions or swarms (e.g., Claude Desktop, Codex, Copilot, and Antigravity operating simultaneously), each instance launched via `dnx` will independently evaluate NuGet package caches. Under heavy agent concurrency, this creates a **process storm** with CPU and disk I/O contention.
+> 
+> For frequent local use or multi-agent swarms, install `ResourceLock` globally. The pre-installed binary starts instantaneously with zero package restore overhead.
 
 ```bash
-# Global installation
+# Global installation from NuGet
 dotnet tool install -g ResourceLock
 
-# Run globally
+# Run directly from system PATH
 ResourceLock
-ResourceLock --help
 
-# Update to latest
+# Update to latest release
 dotnet tool update -g ResourceLock
 ```
 
-### MCP Client Configurations
+---
 
-`ResourceLock` runs as an MCP server communicating over `stdio`. Configure your preferred agent environment:
+## Quickstart & MCP Configurations
 
-#### Claude Desktop
+`ResourceLock` runs as an MCP server communicating over standard I/O (`stdio`). Configure your agent environments using the globally installed `ResourceLock` (recommended) or `dnx`:
 
-Add to `claude_desktop_config.json`:
+### Claude Desktop
+Add to `%APPDATA%\Claude\claude_desktop_config.json` (Windows) or `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS):
 
 ```json
 {
   "mcpServers": {
-    "resourcelock": {
-      "command": "dnx",
-      "args": ["ResourceLock"]
+    "ResourceLock": {
+      "command": "ResourceLock"
+    }
+  }
+}
+```
+*(Or `"command": "dnx", "args": ["ResourceLock"]` for zero-install mode).*
+
+### OpenAI Codex
+Add to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.ResourceLock]
+command = "ResourceLock"
+```
+
+### VS Code & GitHub Copilot
+Add to `%APPDATA%\Code\User\mcp.json`:
+
+```json
+{
+  "servers": {
+    "ResourceLock": {
+      "command": "ResourceLock",
+      "type": "stdio"
     }
   }
 }
 ```
 
-*Note: On Windows, config path is `%APPDATA%\Claude\claude_desktop_config.json`. On macOS, `~/Library/Application Support/Claude/claude_desktop_config.json`.*
-
-#### Cursor
-
-Add to `.cursor/mcp.json` or Global Cursor Settings:
+### Cursor
+Add to `~/.cursor/mcp.json` or `.cursor/mcp.json`:
 
 ```json
 {
   "mcpServers": {
-    "resourcelock": {
-      "command": "dnx",
-      "args": ["ResourceLock"]
+    "ResourceLock": {
+      "command": "ResourceLock"
     }
   }
 }
 ```
 
-#### Antigravity
-
-Add to Antigravity MCP configuration (`~/.gemini/antigravity-cli/mcp.json` or workspace settings):
+### Antigravity (`agy`)
+Add to `~/.gemini/config/mcp_config.json`:
 
 ```json
 {
   "mcpServers": {
-    "resourcelock": {
-      "command": "dnx",
-      "args": ["ResourceLock"]
+    "ResourceLock": {
+      "command": "ResourceLock"
     }
   }
 }

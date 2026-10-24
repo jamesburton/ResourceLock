@@ -28,19 +28,45 @@ Distributed and local hardware resource locking [Model Context Protocol (MCP)](h
 
 ## Quickstart
 
-### Running with `dnx` (Zero-Install)
+### Running with `dnx` (Zero-Install from NuGet)
 
-.NET 10 introduces `dnx`, allowing tools to be executed on-demand without prior global installation:
+.NET 10 introduces `dnx` (`dotnet dnx`), allowing tools published to NuGet to be fetched, cached, and executed on demand without prior global or local installation:
 
 ```bash
+# Launch the stdio MCP server (default mode used by AI agents)
 dnx ResourceLock
+
+# Check version
+dnx ResourceLock -- -v
+
+# View CLI options
+dnx ResourceLock -- --help
+
+# Run standalone coordinator daemon explicitly in a terminal
+dnx ResourceLock -- coordinator
 ```
 
-Alternatively, you can install it globally using the .NET CLI:
+> **How it works with `dnx`**:
+> When an agent launches `dnx ResourceLock`, the .NET runtime automatically pulls the `ResourceLock` tool package directly from NuGet.org into the local user cache and starts the MCP server over standard I/O (`stdin`/`stdout`).
+> You can also pin to an explicit version if desired:
+> ```bash
+> dnx ResourceLock@0.1.0
+> ```
+
+#### Alternative: Global or Local Tool Installation
+
+If you prefer installing `ResourceLock` into your system path instead of running via `dnx`:
 
 ```bash
+# Global installation
 dotnet tool install -g ResourceLock
+
+# Run globally
 ResourceLock
+ResourceLock --help
+
+# Update to latest
+dotnet tool update -g ResourceLock
 ```
 
 ### MCP Client Configurations

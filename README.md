@@ -172,6 +172,15 @@ Acquires an exclusive lock on a specified hardware or compute resource.
 | `wait_seconds` | `int` | No | `0` | Seconds to wait if contended. `0` returns immediately with contention status; `>0` queues the agent. |
 | `timeout_seconds` | `int?` | No | `null` | Maximum seconds to hold the lock before automatic eviction. |
 | `reason` | `string?` | No | `null` | Optional description of the task (e.g., `"Compiling LLVM"`, `"Whisper transcription"`). |
+| `owner` | `string?` | No | `null` | Sub-owner label for parallel subagents sharing one MCP session. The effective session id becomes `{sessionId}:{owner}`. |
+
+> **Parallel subagents:** subagents sharing one `ResourceLock` process must each pass a unique `owner` (e.g. their lane/agent name) to `acquire_lock`, `release_lock` and `release_all_locks`. Without it they share the same session id.
+>
+> **Same-session re-acquire:** acquiring a resource your session already holds (same effective session id) no longer silently succeeds. It fails immediately with `held_by_session` populated and a diagnostic advising a unique `owner`. Explicit TTL renewal is a `renew` flag on the engine-level `LockRequest` (default `false`); it is not currently exposed as an MCP tool parameter.
+
+```json
+{ "resource": "GPU", "wait_seconds": 30, "owner": "lane-a" }
+```
 
 **Success Response (JSON):**
 
@@ -210,6 +219,7 @@ Releases an active lock held by the calling session.
 | Parameter | Type | Required | Description |
 |---|---|---|---|
 | `resource` | `string` | **Yes** | Identifier of the resource to release. |
+| `owner` | `string?` | No | Must match the `owner` used to acquire. If omitted while a sub-owner holds the lock, the response is a hint naming that sub-owner. |
 
 **Response (JSON):**
 
@@ -258,7 +268,13 @@ Queries the coordinator for all currently active locks across the system.
 
 Releases all locks currently owned by the calling session. Recommended as a cleanup step before an agent terminates.
 
-**Parameters:** None.
+**Parameters:**
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `owner` | `string?` | No | Releases only that sub-owner's locks; omit for the base session. |
+
+On process exit, the base session and all sub-owner locks are released.
 
 **Response (JSON):**
 
@@ -269,6 +285,12 @@ Releases all locks currently owned by the calling session. Recommended as a clea
   "resources": ["CPU", "GPU"]
 }
 ```
+
+---
+
+### Concurrency
+
+Requests on one MCP connection are multiplexed (by `MessageId` over IPC) rather than handled head-of-line. A waiting `acquire_lock` (`wait_seconds > 0`) does not block a concurrent `release_lock` on the same pipe.
 
 ---
 

@@ -56,7 +56,11 @@ jobs:
         run: dotnet test ResourceLock.sln --configuration Release --no-restore
 
       - name: Pack packages
-        run: dotnet pack --configuration Release --output ./nupkg
+        # Tag builds take their version from the tag (v0.1.2 -> 0.1.2); manual runs use Directory.Build.props.
+        run: |
+          VERSION_ARG=""
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then VERSION_ARG="-p:Version=${GITHUB_REF_NAME#v}"; fi
+          dotnet pack --configuration Release --output ./nupkg $VERSION_ARG
 
       - name: NuGet Login (OIDC Trusted Publishing)
         id: nuget-login

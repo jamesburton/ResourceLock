@@ -1,0 +1,6 @@
+<Project>
+  <PropertyGroup>
+    <!-- Single version for all packages; CI overrides it from the git tag (vX.Y.Z). -->
+    <Version>0.1.1</Version>
+  </PropertyGroup>
+</Project>

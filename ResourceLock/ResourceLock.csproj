@@ -9,7 +9,6 @@
     <ToolCommandName>ResourceLock</ToolCommandName>
     <PackageId>ResourceLock</PackageId>
     <Title>ResourceLock</Title>
-    <Version>0.1.0</Version>
     <Authors>James Burton</Authors>
     <Description>Distributed and local hardware resource locking MCP server for AI agents.</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>

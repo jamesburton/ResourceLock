@@ -1,6 +1,7 @@
 namespace ResourceLock.Coordinator.Transports;
 
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -27,6 +28,7 @@ public sealed class IpcConnectionHandler
 
     private sealed class ConnectionContext
     {
+        public object SyncRoot { get; } = new();
         public HashSet<string> SessionIds { get; } = new(StringComparer.Ordinal);
         public string? DefaultSessionId { get; set; }
         public int? DefaultPid { get; set; }
@@ -38,6 +40,8 @@ public sealed class IpcConnectionHandler
         ArgumentNullException.ThrowIfNull(stream);
 
         var context = new ConnectionContext();
+        using var writeGate = new SemaphoreSlim(1, 1);
+        var inFlightTasks = new ConcurrentDictionary<Task, byte>();
 
         try
         {
@@ -71,17 +75,46 @@ public sealed class IpcConnectionHandler
                     break;
                 }
 
-                await ProcessEnvelopeAsync(stream, envelope, context, cancellationToken).ConfigureAwait(false);
+                var task = ProcessEnvelopeAsync(stream, writeGate, envelope, context, cancellationToken);
+                if (!task.IsCompleted)
+                {
+                    inFlightTasks.TryAdd(task, 0);
+                    _ = task.ContinueWith(
+                        t => inFlightTasks.TryRemove(t, out _),
+                        CancellationToken.None,
+                        TaskContinuationOptions.ExecuteSynchronously,
+                        TaskScheduler.Default);
+                }
             }
         }
         finally
         {
-            if (!string.IsNullOrEmpty(context.DefaultSessionId))
+            var pending = inFlightTasks.Keys.ToArray();
+            if (pending.Length > 0)
             {
-                context.SessionIds.Add(context.DefaultSessionId);
+                try
+                {
+                    await Task.WhenAll(pending).ConfigureAwait(false);
+                }
+                catch
+                {
+                }
             }
 
-            foreach (var sessionId in context.SessionIds)
+            string[] sessionIdsToRelease;
+            RemoteLockKey[] remoteLocksToRelease;
+            lock (context.SyncRoot)
+            {
+                if (!string.IsNullOrEmpty(context.DefaultSessionId))
+                {
+                    context.SessionIds.Add(context.DefaultSessionId);
+                }
+                sessionIdsToRelease = context.SessionIds.ToArray();
+                remoteLocksToRelease = context.RemoteLocks.ToArray();
+                context.RemoteLocks.Clear();
+            }
+
+            foreach (var sessionId in sessionIdsToRelease)
             {
                 try
                 {
@@ -93,7 +126,7 @@ public sealed class IpcConnectionHandler
                 }
             }
 
-            foreach (var remoteLock in context.RemoteLocks)
+            foreach (var remoteLock in remoteLocksToRelease)
             {
                 try
                 {
@@ -108,12 +141,29 @@ public sealed class IpcConnectionHandler
                     // Ignore exceptions during disconnect cleanup
                 }
             }
-            context.RemoteLocks.Clear();
+        }
+    }
+
+    private static async Task WriteFrameSafeAsync(
+        Stream stream,
+        SemaphoreSlim writeGate,
+        IpcEnvelope envelope,
+        CancellationToken cancellationToken)
+    {
+        await writeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await IpcFrameCodec.WriteFrameAsync(stream, envelope, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            writeGate.Release();
         }
     }
 
     private async Task ProcessEnvelopeAsync(
         Stream stream,
+        SemaphoreSlim writeGate,
         IpcEnvelope envelope,
         ConnectionContext context,
         CancellationToken cancellationToken)
@@ -127,9 +177,12 @@ public sealed class IpcConnectionHandler
                     var session = JsonSerializer.Deserialize<SessionInfo>(envelope.PayloadJson, IpcFrameCodec.DefaultJsonOptions);
                     if (session != null)
                     {
-                        context.DefaultSessionId = session.SessionId;
-                        context.DefaultPid = session.OwnerPid;
-                        context.SessionIds.Add(session.SessionId);
+                        lock (context.SyncRoot)
+                        {
+                            context.DefaultSessionId = session.SessionId;
+                            context.DefaultPid = session.OwnerPid;
+                            context.SessionIds.Add(session.SessionId);
+                        }
                     }
                 }
 
@@ -137,32 +190,43 @@ public sealed class IpcConnectionHandler
                     envelope.MessageId,
                     IpcMessageType.Response,
                     JsonSerializer.Serialize(new { success = true }, IpcFrameCodec.DefaultJsonOptions));
-                await IpcFrameCodec.WriteFrameAsync(stream, resp, cancellationToken).ConfigureAwait(false);
+                await WriteFrameSafeAsync(stream, writeGate, resp, cancellationToken).ConfigureAwait(false);
                 break;
             }
 
             case IpcMessageType.Acquire:
             {
+                string? defaultSessionId;
+                int? defaultPid;
+                lock (context.SyncRoot)
+                {
+                    defaultSessionId = context.DefaultSessionId;
+                    defaultPid = context.DefaultPid;
+                }
+
                 if (string.IsNullOrEmpty(envelope.PayloadJson))
                 {
-                    var errorResult = new LockResult(false, "", context.DefaultSessionId, context.DefaultPid, "Payload is required for Acquire", null);
+                    var errorResult = new LockResult(false, "", defaultSessionId, defaultPid, "Payload is required for Acquire", null);
                     var errEnvelope = new IpcEnvelope(envelope.MessageId, IpcMessageType.Response, JsonSerializer.Serialize(errorResult, IpcFrameCodec.DefaultJsonOptions));
-                    await IpcFrameCodec.WriteFrameAsync(stream, errEnvelope, cancellationToken).ConfigureAwait(false);
+                    await WriteFrameSafeAsync(stream, writeGate, errEnvelope, cancellationToken).ConfigureAwait(false);
                     return;
                 }
 
                 var request = JsonSerializer.Deserialize<LockRequest>(envelope.PayloadJson, IpcFrameCodec.DefaultJsonOptions);
                 if (request == null)
                 {
-                    var errorResult = new LockResult(false, "", context.DefaultSessionId, context.DefaultPid, "Invalid LockRequest payload", null);
+                    var errorResult = new LockResult(false, "", defaultSessionId, defaultPid, "Invalid LockRequest payload", null);
                     var errEnvelope = new IpcEnvelope(envelope.MessageId, IpcMessageType.Response, JsonSerializer.Serialize(errorResult, IpcFrameCodec.DefaultJsonOptions));
-                    await IpcFrameCodec.WriteFrameAsync(stream, errEnvelope, cancellationToken).ConfigureAwait(false);
+                    await WriteFrameSafeAsync(stream, writeGate, errEnvelope, cancellationToken).ConfigureAwait(false);
                     return;
                 }
 
-                context.SessionIds.Add(request.SessionId);
-                context.DefaultSessionId ??= request.SessionId;
-                context.DefaultPid ??= request.OwnerPid;
+                lock (context.SyncRoot)
+                {
+                    context.SessionIds.Add(request.SessionId);
+                    context.DefaultSessionId ??= request.SessionId;
+                    context.DefaultPid ??= request.OwnerPid;
+                }
 
                 var parsed = RemoteResourceParser.Parse(request.Resource);
                 LockResult result;
@@ -171,7 +235,10 @@ public sealed class IpcConnectionHandler
                     result = await _remoteCoordinatorClient.ForwardAcquireAsync(parsed.Host, request, cancellationToken).ConfigureAwait(false);
                     if (result.Success)
                     {
-                        context.RemoteLocks.Add(new RemoteLockKey(parsed.Host, parsed.Resource, request.SessionId));
+                        lock (context.SyncRoot)
+                        {
+                            context.RemoteLocks.Add(new RemoteLockKey(parsed.Host, parsed.Resource, request.SessionId));
+                        }
                     }
                 }
                 else
@@ -183,14 +250,20 @@ public sealed class IpcConnectionHandler
                     envelope.MessageId,
                     IpcMessageType.Response,
                     JsonSerializer.Serialize(result, IpcFrameCodec.DefaultJsonOptions));
-                await IpcFrameCodec.WriteFrameAsync(stream, resp, cancellationToken).ConfigureAwait(false);
+                await WriteFrameSafeAsync(stream, writeGate, resp, cancellationToken).ConfigureAwait(false);
                 break;
             }
 
             case IpcMessageType.Release:
             {
                 string? resource = null;
-                string? sessionId = context.DefaultSessionId;
+                string? sessionId;
+                int? defaultPid;
+                lock (context.SyncRoot)
+                {
+                    sessionId = context.DefaultSessionId;
+                    defaultPid = context.DefaultPid;
+                }
 
                 if (!string.IsNullOrEmpty(envelope.PayloadJson))
                 {
@@ -207,9 +280,9 @@ public sealed class IpcConnectionHandler
 
                 if (string.IsNullOrEmpty(resource))
                 {
-                    var errorResult = new LockResult(false, "", sessionId, context.DefaultPid, "Resource is required for Release", null);
+                    var errorResult = new LockResult(false, "", sessionId, defaultPid, "Resource is required for Release", null);
                     var errEnvelope = new IpcEnvelope(envelope.MessageId, IpcMessageType.Response, JsonSerializer.Serialize(errorResult, IpcFrameCodec.DefaultJsonOptions));
-                    await IpcFrameCodec.WriteFrameAsync(stream, errEnvelope, cancellationToken).ConfigureAwait(false);
+                    await WriteFrameSafeAsync(stream, writeGate, errEnvelope, cancellationToken).ConfigureAwait(false);
                     return;
                 }
 
@@ -220,7 +293,10 @@ public sealed class IpcConnectionHandler
                     result = await _remoteCoordinatorClient.ForwardReleaseAsync(parsed.Host, parsed.Resource, sessionId ?? "", cancellationToken).ConfigureAwait(false);
                     if (result.Success)
                     {
-                        context.RemoteLocks.Remove(new RemoteLockKey(parsed.Host, parsed.Resource, sessionId ?? ""));
+                        lock (context.SyncRoot)
+                        {
+                            context.RemoteLocks.Remove(new RemoteLockKey(parsed.Host, parsed.Resource, sessionId ?? ""));
+                        }
                     }
                 }
                 else
@@ -232,13 +308,18 @@ public sealed class IpcConnectionHandler
                     envelope.MessageId,
                     IpcMessageType.Response,
                     JsonSerializer.Serialize(result, IpcFrameCodec.DefaultJsonOptions));
-                await IpcFrameCodec.WriteFrameAsync(stream, resp, cancellationToken).ConfigureAwait(false);
+                await WriteFrameSafeAsync(stream, writeGate, resp, cancellationToken).ConfigureAwait(false);
                 break;
             }
 
             case IpcMessageType.ReleaseAll:
             {
-                string? sessionId = context.DefaultSessionId;
+                string? sessionId;
+                lock (context.SyncRoot)
+                {
+                    sessionId = context.DefaultSessionId;
+                }
+
                 if (!string.IsNullOrEmpty(envelope.PayloadJson))
                 {
                     using var doc = JsonDocument.Parse(envelope.PayloadJson);
@@ -253,7 +334,12 @@ public sealed class IpcConnectionHandler
                 {
                     count = await _lockEngine.ReleaseAllForSessionAsync(sessionId, cancellationToken).ConfigureAwait(false);
 
-                    var sessionRemoteLocks = context.RemoteLocks.Where(l => l.SessionId == sessionId).ToList();
+                    List<RemoteLockKey> sessionRemoteLocks;
+                    lock (context.SyncRoot)
+                    {
+                        sessionRemoteLocks = context.RemoteLocks.Where(l => l.SessionId == sessionId).ToList();
+                    }
+
                     foreach (var remoteLock in sessionRemoteLocks)
                     {
                         try
@@ -267,7 +353,10 @@ public sealed class IpcConnectionHandler
                             if (releaseResult.Success)
                             {
                                 count++;
-                                context.RemoteLocks.Remove(remoteLock);
+                                lock (context.SyncRoot)
+                                {
+                                    context.RemoteLocks.Remove(remoteLock);
+                                }
                             }
                         }
                         catch
@@ -281,7 +370,7 @@ public sealed class IpcConnectionHandler
                     envelope.MessageId,
                     IpcMessageType.Response,
                     JsonSerializer.Serialize(new { count }, IpcFrameCodec.DefaultJsonOptions));
-                await IpcFrameCodec.WriteFrameAsync(stream, resp, cancellationToken).ConfigureAwait(false);
+                await WriteFrameSafeAsync(stream, writeGate, resp, cancellationToken).ConfigureAwait(false);
                 break;
             }
 
@@ -292,7 +381,7 @@ public sealed class IpcConnectionHandler
                     envelope.MessageId,
                     IpcMessageType.Response,
                     JsonSerializer.Serialize(locks, IpcFrameCodec.DefaultJsonOptions));
-                await IpcFrameCodec.WriteFrameAsync(stream, resp, cancellationToken).ConfigureAwait(false);
+                await WriteFrameSafeAsync(stream, writeGate, resp, cancellationToken).ConfigureAwait(false);
                 break;
             }
 
@@ -302,7 +391,7 @@ public sealed class IpcConnectionHandler
                     envelope.MessageId,
                     IpcMessageType.Response,
                     JsonSerializer.Serialize(new { status = "pong" }, IpcFrameCodec.DefaultJsonOptions));
-                await IpcFrameCodec.WriteFrameAsync(stream, resp, cancellationToken).ConfigureAwait(false);
+                await WriteFrameSafeAsync(stream, writeGate, resp, cancellationToken).ConfigureAwait(false);
                 break;
             }
 

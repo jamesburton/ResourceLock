@@ -206,4 +206,118 @@ public class McpToolsTests
         var rel = await tools.ReleaseLockAsync("CPU");
         Assert.True(rel.Success);
     }
+
+    [Fact]
+    public async Task SubagentOwners_ShareSingleMcpToolsInstance_BlockAndReleaseIndependently()
+    {
+        var engine = new InMemoryLockEngine();
+        var currentPid = Environment.ProcessId;
+        var tools = new ResourceLockTools(engine, sessionId: "sess-parent", ownerPid: currentPid);
+
+        // 1. Default session acquires CPU
+        var acq1 = await tools.AcquireLockAsync("CPU", wait_seconds: 0, reason: "Lane 1 build");
+        Assert.True(acq1.Success);
+        Assert.Equal("sess-parent", acq1.SessionId);
+
+        // 2. Second acquire without owner fails immediately with diagnostic message
+        var dup = await tools.AcquireLockAsync("CPU", wait_seconds: 5, reason: "Duplicate without owner");
+        Assert.False(dup.Success);
+        Assert.Contains("already locked by this session", dup.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("owner", dup.Message, StringComparison.OrdinalIgnoreCase);
+
+        // 3. Subagent with owner 'lane-2' queues behind default session
+        var lane2Task = tools.AcquireLockAsync("CPU", wait_seconds: 5, reason: "Lane 2 test", owner: "lane-2");
+        Assert.False(lane2Task.IsCompleted);
+
+        // 4. Default session releases CPU -> lane-2 acquires it
+        var rel1 = await tools.ReleaseLockAsync("CPU");
+        Assert.True(rel1.Success);
+
+        var acq2 = await lane2Task;
+        Assert.True(acq2.Success);
+        Assert.Equal("sess-parent:lane-2", acq2.SessionId);
+
+        // 5. Calling ReleaseLockAsync without owner when 'lane-2' holds it fails with helpful hint
+        var wrongRel = await tools.ReleaseLockAsync("CPU");
+        Assert.False(wrongRel.Success);
+        Assert.Contains("lane-2", wrongRel.Message, StringComparison.OrdinalIgnoreCase);
+
+        // 6. Process exit cleanup releases all sub-session locks as well
+        await tools.AcquireLockAsync("GPU", wait_seconds: 0, owner: "lane-3");
+        var totalExitReleased = await tools.ReleaseAllSessionAndSubsessionLocksAsync();
+        Assert.Equal(2, totalExitReleased);
+        Assert.Empty(await tools.ListLocksAsync());
+    }
+
+    [Fact]
+    public async Task McpServerHost_And_IpcLockEngine_MultiplexConcurrentWaitAndReleaseWithoutHeadOfLineBlocking()
+    {
+        var pipeName = OperatingSystem.IsWindows()
+            ? "test-mcp-mux-" + Guid.NewGuid().ToString("N")
+            : Path.Combine(Path.GetTempPath(), $"rl-mux-{Guid.NewGuid():N}.sock");
+
+        var engine = new InMemoryLockEngine();
+        await using var server = new CoordinatorServer(engine, httpPort: -1, customPipeOrSocketName: pipeName);
+        await server.StartAsync();
+
+        var ipcStream = await DaemonSpawner.TryConnectAsync(pipeName, 2000, CancellationToken.None);
+        Assert.NotNull(ipcStream);
+
+        var currentPid = Environment.ProcessId;
+        await using var ipcEngine = new IpcLockEngine(ipcStream);
+        await ipcEngine.RegisterSessionAsync("sess-mux", currentPid);
+
+        var tools = new ResourceLockTools(ipcEngine, sessionId: "sess-mux", ownerPid: currentPid);
+        var host = new McpServerHost(tools);
+
+        using var clientToServerPipe = new System.IO.Pipes.AnonymousPipeServerStream(System.IO.Pipes.PipeDirection.Out);
+        using var serverInputPipe = new System.IO.Pipes.AnonymousPipeClientStream(System.IO.Pipes.PipeDirection.In, clientToServerPipe.GetClientHandleAsString());
+        using var serverToClientPipe = new System.IO.Pipes.AnonymousPipeServerStream(System.IO.Pipes.PipeDirection.Out);
+        using var clientOutputPipe = new System.IO.Pipes.AnonymousPipeClientStream(System.IO.Pipes.PipeDirection.In, serverToClientPipe.GetClientHandleAsString());
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var hostTask = host.RunAsync(serverInputPipe, serverToClientPipe, cts.Token);
+
+        await using var writer = new StreamWriter(clientToServerPipe, new UTF8Encoding(false)) { AutoFlush = true };
+        using var reader = new StreamReader(clientOutputPipe, Encoding.UTF8);
+
+        // 1. Lane 1 acquires CPU
+        await writer.WriteLineAsync("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"acquire_lock\",\"arguments\":{\"resource\":\"CPU\",\"owner\":\"lane-1\",\"reason\":\"Lane 1\"}}}");
+        var resp1Line = await reader.ReadLineAsync(cts.Token);
+        Assert.NotNull(resp1Line);
+        using var doc1 = JsonDocument.Parse(resp1Line);
+        Assert.Equal(1, doc1.RootElement.GetProperty("id").GetInt32());
+        var text1 = doc1.RootElement.GetProperty("result").GetProperty("content")[0].GetProperty("text").GetString();
+        Assert.Contains("\"success\": true", text1);
+
+        // 2. Lane 2 requests CPU with wait_seconds: 5 (blocks waiting for Lane 1)
+        await writer.WriteLineAsync("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"acquire_lock\",\"arguments\":{\"resource\":\"CPU\",\"wait_seconds\":5,\"owner\":\"lane-2\",\"reason\":\"Lane 2\"}}}");
+
+        // Give Lane 2 a moment to enter the coordinator wait queue
+        await Task.Delay(150, cts.Token);
+
+        // 3. While Lane 2 is blocked waiting, Lane 1 sends release_lock on the SAME MCP stdio + IPC stream
+        await writer.WriteLineAsync("{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"release_lock\",\"arguments\":{\"resource\":\"CPU\",\"owner\":\"lane-1\"}}}");
+
+        var respA = await reader.ReadLineAsync(cts.Token);
+        var respB = await reader.ReadLineAsync(cts.Token);
+        Assert.NotNull(respA);
+        Assert.NotNull(respB);
+
+        using var docA = JsonDocument.Parse(respA);
+        using var docB = JsonDocument.Parse(respB);
+        var ids = new[] { docA.RootElement.GetProperty("id").GetInt32(), docB.RootElement.GetProperty("id").GetInt32() };
+        Assert.Contains(2, ids);
+        Assert.Contains(3, ids);
+
+        var textA = docA.RootElement.GetProperty("result").GetProperty("content")[0].GetProperty("text").GetString();
+        var textB = docB.RootElement.GetProperty("result").GetProperty("content")[0].GetProperty("text").GetString();
+        Assert.Contains("\"success\": true", textA);
+        Assert.Contains("\"success\": true", textB);
+
+        await writer.DisposeAsync();
+        await hostTask;
+        var rel = new { Success = true };
+        Assert.True(rel.Success);
+    }
 }

@@ -33,6 +33,22 @@ public class InMemoryLockEngineTests
     }
 
     [Fact]
+    public async Task Acquire_SameSessionWithoutRenew_FailsImmediatelyWithDiagnosticMessage()
+    {
+        var engine = new InMemoryLockEngine();
+        await engine.AcquireAsync(new LockRequest("CPU", "sess-1", LivePid, Reason: "Lane 1 build"));
+
+        var duplicateResult = await engine.AcquireAsync(new LockRequest("CPU", "sess-1", LivePid, WaitSeconds: 30, Reason: "Lane 2 test"));
+
+        Assert.False(duplicateResult.Success);
+        Assert.NotNull(duplicateResult.CurrentHolder);
+        Assert.Equal("sess-1", duplicateResult.CurrentHolder.SessionId);
+        Assert.Equal("Lane 1 build", duplicateResult.CurrentHolder.Reason);
+        Assert.Contains("already locked by this session", duplicateResult.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("owner", duplicateResult.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task Release_Unblocks_QueuedWaiter()
     {
         var engine = new InMemoryLockEngine();
@@ -238,7 +254,7 @@ public class InMemoryLockEngineTests
         var waiterTask = engine.AcquireAsync(new LockRequest("gpu", "sess-waiter", LivePid, WaitSeconds: 5));
         Assert.False(waiterTask.IsCompleted);
 
-        var renewResult = await engine.AcquireAsync(new LockRequest("gpu", "sess-holder", LivePid, TimeoutSeconds: 120));
+        var renewResult = await engine.AcquireAsync(new LockRequest("gpu", "sess-holder", LivePid, TimeoutSeconds: 120, Renew: true));
         Assert.True(renewResult.Success);
 
         Assert.False(waiterTask.IsCompleted);
@@ -265,7 +281,7 @@ public class InMemoryLockEngineTests
         timeProvider.Advance(TimeSpan.FromSeconds(2));
 
         // 4. Renew lock with 60 second timeout (should supersede the 5-second timer)
-        var renewResult = await engine.AcquireAsync(new LockRequest("gpu", "sess-holder", LivePid, TimeoutSeconds: 60));
+        var renewResult = await engine.AcquireAsync(new LockRequest("gpu", "sess-holder", LivePid, TimeoutSeconds: 60, Renew: true));
         Assert.True(renewResult.Success);
 
         // 5. Advance time by 4 more seconds (total 6 seconds: the original 5s timer has expired)

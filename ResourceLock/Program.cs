@@ -118,7 +118,7 @@ Options:
         {
             try
             {
-                await tools.ReleaseAllLocksAsync().ConfigureAwait(false);
+                await tools.ReleaseAllSessionAndSubsessionLocksAsync().ConfigureAwait(false);
             }
             catch
             {

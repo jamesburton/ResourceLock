@@ -70,6 +70,22 @@ public sealed class InMemoryLockEngine : ILockEngine, IDisposable
             // If lock held by same session, allow re-entrancy / update
             if (activeLock != null && activeLock.Record.SessionId == request.SessionId)
             {
+                if (!request.Renew)
+                {
+                    var existingReason = string.IsNullOrWhiteSpace(activeLock.Record.Reason)
+                        ? "unspecified"
+                        : activeLock.Record.Reason;
+
+                    return ValueTask.FromResult(new LockResult(
+                        false,
+                        resource,
+                        request.SessionId,
+                        activeLock.Record.OwnerPid,
+                        $"Resource '{resource}' is already locked by this session (reason: '{existingReason}'). If you already acquired this lock earlier in your task, you do not need to acquire it again. If you are a parallel subagent or lane sharing this session, retry acquire_lock with a unique 'owner' identifier (e.g., owner: 'lane-2') so your request queues properly.",
+                        activeLock.Record.ExpiresAt,
+                        activeLock.Record));
+                }
+
                 activeLock.ExpirationCts?.Dispose();
                 activeLock.ExpirationCts = null;
 

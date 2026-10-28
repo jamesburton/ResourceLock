@@ -1,6 +1,7 @@
 namespace ResourceLock.Mcp;
 
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -43,69 +44,137 @@ public sealed class McpServerHost
         {
             AutoFlush = true
         };
+        using var writeGate = new SemaphoreSlim(1, 1);
+        var inFlightTasks = new ConcurrentDictionary<Task, byte>();
 
-        while (!cancellationToken.IsCancellationRequested)
+        try
         {
-            string? line;
-            try
+            while (!cancellationToken.IsCancellationRequested)
             {
-                line = await reader.ReadLineAsync(cancellationToken).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
-                break;
-            }
-            catch (EndOfStreamException)
-            {
-                break;
-            }
-
-            if (line == null)
-            {
-                // EOF reached
-                break;
-            }
-
-            if (string.IsNullOrWhiteSpace(line))
-            {
-                continue;
-            }
-
-            // Handle potential Content-Length prefix (LSP / MCP header framing)
-            if (line.StartsWith("Content-Length:", StringComparison.OrdinalIgnoreCase))
-            {
-                var lengthStr = line["Content-Length:".Length..].Trim();
-                if (int.TryParse(lengthStr, out var length))
+                string? line;
+                try
                 {
-                    while (!cancellationToken.IsCancellationRequested)
-                    {
-                        var emptyLine = await reader.ReadLineAsync(cancellationToken).ConfigureAwait(false);
-                        if (string.IsNullOrEmpty(emptyLine)) break;
-                    }
+                    line = await reader.ReadLineAsync(cancellationToken).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+                catch (EndOfStreamException)
+                {
+                    break;
+                }
 
-                    var buffer = new char[length];
-                    var charsRead = 0;
-                    while (charsRead < length && !cancellationToken.IsCancellationRequested)
-                    {
-                        var count = await reader.ReadAsync(buffer.AsMemory(charsRead, length - charsRead), cancellationToken).ConfigureAwait(false);
-                        if (count == 0) break;
-                        charsRead += count;
-                    }
+                if (line == null)
+                {
+                    // EOF reached
+                    break;
+                }
 
-                    line = new string(buffer, 0, charsRead);
+                if (string.IsNullOrWhiteSpace(line))
+                {
+                    continue;
+                }
+
+                // Handle potential Content-Length prefix (LSP / MCP header framing)
+                if (line.StartsWith("Content-Length:", StringComparison.OrdinalIgnoreCase))
+                {
+                    var lengthStr = line["Content-Length:".Length..].Trim();
+                    if (int.TryParse(lengthStr, out var length))
+                    {
+                        while (!cancellationToken.IsCancellationRequested)
+                        {
+                            var emptyLine = await reader.ReadLineAsync(cancellationToken).ConfigureAwait(false);
+                            if (string.IsNullOrEmpty(emptyLine)) break;
+                        }
+
+                        var buffer = new char[length];
+                        var charsRead = 0;
+                        while (charsRead < length && !cancellationToken.IsCancellationRequested)
+                        {
+                            var count = await reader.ReadAsync(buffer.AsMemory(charsRead, length - charsRead), cancellationToken).ConfigureAwait(false);
+                            if (count == 0) break;
+                            charsRead += count;
+                        }
+
+                        line = new string(buffer, 0, charsRead);
+                    }
+                }
+
+                if (string.IsNullOrWhiteSpace(line))
+                {
+                    continue;
+                }
+
+                var msgTask = ProcessMessageAsync(line, cancellationToken);
+                if (msgTask.IsCompleted)
+                {
+                    var responseJson = await msgTask.ConfigureAwait(false);
+                    if (responseJson != null)
+                    {
+                        await writeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+                        try
+                        {
+                            await writer.WriteLineAsync(responseJson).ConfigureAwait(false);
+                        }
+                        finally
+                        {
+                            writeGate.Release();
+                        }
+                    }
+                }
+                else
+                {
+                    var backgroundTask = CompleteAndWriteMessageAsync(msgTask, writer, writeGate, cancellationToken);
+                    inFlightTasks.TryAdd(backgroundTask, 0);
+                    _ = backgroundTask.ContinueWith(
+                        t => inFlightTasks.TryRemove(t, out _),
+                        CancellationToken.None,
+                        TaskContinuationOptions.ExecuteSynchronously,
+                        TaskScheduler.Default);
                 }
             }
-
-            if (string.IsNullOrWhiteSpace(line))
+        }
+        finally
+        {
+            var remaining = inFlightTasks.Keys.ToArray();
+            if (remaining.Length > 0)
             {
-                continue;
+                try
+                {
+                    await Task.WhenAll(remaining).ConfigureAwait(false);
+                }
+                catch
+                {
+                }
             }
+        }
+    }
 
-            var responseJson = await ProcessMessageAsync(line, cancellationToken).ConfigureAwait(false);
+    private static async Task CompleteAndWriteMessageAsync(
+        Task<string?> msgTask,
+        StreamWriter writer,
+        SemaphoreSlim writeGate,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var responseJson = await msgTask.ConfigureAwait(false);
             if (responseJson != null)
             {
-                await writer.WriteLineAsync(responseJson).ConfigureAwait(false);
+                await writeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+                try
+                {
+                    await writer.WriteLineAsync(responseJson).ConfigureAwait(false);
+                }
+                finally
+                {
+                    writeGate.Release();
+                }
             }
+        }
+        catch (OperationCanceledException)
+        {
         }
     }
 
@@ -213,7 +282,7 @@ public sealed class McpServerHost
                 JsonElement arguments = default;
                 if (paramsProp.TryGetProperty("arguments", out var argsProp) && argsProp.ValueKind == JsonValueKind.Object)
                 {
-                    arguments = argsProp;
+                    arguments = argsProp.Clone();
                 }
 
                 return await DispatchToolCallAsync(id, toolName, arguments, cancellationToken).ConfigureAwait(false);
@@ -270,6 +339,11 @@ public sealed class McpServerHost
                         {
                             type = "string",
                             description = "Short explanation of work being performed."
+                        },
+                        ["owner"] = new
+                        {
+                            type = "string",
+                            description = "Optional unique caller/subagent identifier (e.g. 'lane-1') when running parallel subagents in the same session."
                         }
                     },
                     required = new[] { "resource" }
@@ -288,6 +362,11 @@ public sealed class McpServerHost
                         {
                             type = "string",
                             description = "Identifier of the resource to release."
+                        },
+                        ["owner"] = new
+                        {
+                            type = "string",
+                            description = "Optional unique caller/subagent identifier if one was used when acquiring the lock."
                         }
                     },
                     required = new[] { "resource" }
@@ -310,7 +389,14 @@ public sealed class McpServerHost
                 inputSchema = new
                 {
                     type = "object",
-                    properties = new Dictionary<string, object>()
+                    properties = new Dictionary<string, object>
+                    {
+                        ["owner"] = new
+                        {
+                            type = "string",
+                            description = "Optional unique caller/subagent identifier if releasing locks for a specific subagent."
+                        }
+                    }
                 }
             }
         ];
@@ -332,6 +418,7 @@ public sealed class McpServerHost
                     int waitSeconds = 0;
                     int? timeoutSeconds = null;
                     string? reason = null;
+                    string? owner = null;
 
                     if (arguments.ValueKind == JsonValueKind.Object)
                     {
@@ -354,6 +441,10 @@ public sealed class McpServerHost
                         {
                             reason = reaProp.GetString();
                         }
+                        if (arguments.TryGetProperty("owner", out var ownProp) || arguments.TryGetProperty("Owner", out ownProp))
+                        {
+                            owner = ownProp.GetString();
+                        }
                     }
 
                     if (string.IsNullOrWhiteSpace(resource))
@@ -361,7 +452,7 @@ public sealed class McpServerHost
                         return CreateToolErrorResponse(id, "Parameter 'resource' is required.");
                     }
 
-                    var lockResult = await _tools.AcquireLockAsync(resource, waitSeconds, timeoutSeconds, reason, cancellationToken).ConfigureAwait(false);
+                    var lockResult = await _tools.AcquireLockAsync(resource, waitSeconds, timeoutSeconds, reason, owner, cancellationToken).ConfigureAwait(false);
 
                     object payload = lockResult.Success
                         ? new
@@ -389,11 +480,16 @@ public sealed class McpServerHost
                 case "release_lock":
                 {
                     string resource = "";
+                    string? owner = null;
                     if (arguments.ValueKind == JsonValueKind.Object)
                     {
                         if (arguments.TryGetProperty("resource", out var rProp) || arguments.TryGetProperty("Resource", out rProp))
                         {
                             resource = rProp.GetString() ?? "";
+                        }
+                        if (arguments.TryGetProperty("owner", out var ownProp) || arguments.TryGetProperty("Owner", out ownProp))
+                        {
+                            owner = ownProp.GetString();
                         }
                     }
 
@@ -402,7 +498,7 @@ public sealed class McpServerHost
                         return CreateToolErrorResponse(id, "Parameter 'resource' is required.");
                     }
 
-                    var relResult = await _tools.ReleaseLockAsync(resource, cancellationToken).ConfigureAwait(false);
+                    var relResult = await _tools.ReleaseLockAsync(resource, owner, cancellationToken).ConfigureAwait(false);
                     var payload = new
                     {
                         success = relResult.Success,
@@ -431,7 +527,16 @@ public sealed class McpServerHost
 
                 case "release_all_locks":
                 {
-                    var res = await _tools.ReleaseAllLocksAsync(cancellationToken).ConfigureAwait(false);
+                    string? owner = null;
+                    if (arguments.ValueKind == JsonValueKind.Object)
+                    {
+                        if (arguments.TryGetProperty("owner", out var ownProp) || arguments.TryGetProperty("Owner", out ownProp))
+                        {
+                            owner = ownProp.GetString();
+                        }
+                    }
+
+                    var res = await _tools.ReleaseAllLocksAsync(owner, cancellationToken).ConfigureAwait(false);
                     var payload = new
                     {
                         success = res.Success,

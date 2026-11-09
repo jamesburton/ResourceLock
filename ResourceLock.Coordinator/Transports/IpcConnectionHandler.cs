@@ -20,8 +20,14 @@ public sealed class IpcConnectionHandler
     private readonly ILockEngine _lockEngine;
     private readonly IRemoteCoordinatorClient _remoteCoordinatorClient;
 
-    public IpcConnectionHandler(ILockEngine lockEngine, IRemoteCoordinatorClient? remoteCoordinatorClient = null)
+    private readonly Action? _onShutdownRequested;
+
+    public IpcConnectionHandler(
+        ILockEngine lockEngine,
+        IRemoteCoordinatorClient? remoteCoordinatorClient = null,
+        Action? onShutdownRequested = null)
     {
+        _onShutdownRequested = onShutdownRequested;
         _lockEngine = lockEngine ?? throw new ArgumentNullException(nameof(lockEngine));
         _remoteCoordinatorClient = remoteCoordinatorClient ?? new RemoteCoordinatorClient();
     }
@@ -392,6 +398,18 @@ public sealed class IpcConnectionHandler
                     IpcMessageType.Response,
                     JsonSerializer.Serialize(new { status = "pong" }, IpcFrameCodec.DefaultJsonOptions));
                 await WriteFrameSafeAsync(stream, writeGate, resp, cancellationToken).ConfigureAwait(false);
+                break;
+            }
+
+            case IpcMessageType.Shutdown:
+            {
+                var held = await _lockEngine.ListLocksAsync(cancellationToken).ConfigureAwait(false);
+                var resp = new IpcEnvelope(
+                    envelope.MessageId,
+                    IpcMessageType.Response,
+                    JsonSerializer.Serialize(new { heldLocks = held }, IpcFrameCodec.DefaultJsonOptions));
+                await WriteFrameSafeAsync(stream, writeGate, resp, cancellationToken).ConfigureAwait(false);
+                _onShutdownRequested?.Invoke();
                 break;
             }
 

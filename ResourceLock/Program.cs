@@ -48,6 +48,9 @@ Usage:
 
 Commands:
   coordinator        Run in standalone coordinator daemon mode
+  coordinator --restart [--force]
+                     Gracefully restart the running coordinator daemon. Refuses (exit 2)
+                     if locks are held unless --force is given; held locks are revoked.
 
 Options:
   -h, --help         Show help and usage information
@@ -57,6 +60,12 @@ Options:
 
     public static async Task<int> RunCoordinatorAsync(string[] args, CancellationToken cancellationToken = default)
     {
+        if (args.Any(a => a.Equals("--restart", StringComparison.OrdinalIgnoreCase)))
+        {
+            var force = args.Any(a => a.Equals("--force", StringComparison.OrdinalIgnoreCase));
+            return await CoordinatorRestarter.RestartAsync(force, Console.Out, Console.Error, cancellationToken).ConfigureAwait(false);
+        }
+
         var engine = new InMemoryLockEngine();
         await using var coordinator = new CoordinatorServer(engine);
 
@@ -72,7 +81,7 @@ Options:
 
         try
         {
-            await Task.Delay(Timeout.Infinite, cts.Token).ConfigureAwait(false);
+            await Task.WhenAny(Task.Delay(Timeout.Infinite, cts.Token), coordinator.ShutdownRequested).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {

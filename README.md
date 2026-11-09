@@ -288,9 +288,33 @@ On process exit, the base session and all sub-owner locks are released.
 
 ---
 
+### 5. `coordinator_status`
+
+Reports coordinator health without taking a lock: daemon `pid`, `startedAt` (UTC), `connectedClients`, `heldLocks` (count) and `version`. Use `list_locks` to see who holds what.
+
+---
+
 ### Concurrency
 
 Requests on one MCP connection are multiplexed (by `MessageId` over IPC) rather than handled head-of-line. A waiting `acquire_lock` (`wait_seconds > 0`) does not block a concurrent `release_lock` on the same pipe.
+
+---
+
+## Coordinator Restarts & Reconnection
+
+The coordinator keeps lock state in memory, so restarting it revokes every held lock. MCP server instances survive this:
+
+- When the coordinator connection breaks, the instance reconnects with backoff (re-spawning the daemon under the spawn lock if none is running), re-registers its session and retries the failed request once. No session restart is needed.
+- Locks the session held before the restart are gone. The next `acquire_lock` / `release_lock` result says so, e.g. `Coordinator connection was lost and re-established (coordinator restarted); locks previously held by this session were released: CPU.`
+- If the coordinator cannot be reached after the retries, the error reads `Coordinator connection lost and reconnect failed: ...`.
+
+### CLI health and restart
+
+```bash
+resourcelock status                       # pid, start time, clients, held locks; exit 1 if not running (never spawns a daemon)
+resourcelock coordinator --restart        # refuses (exit 2) and lists holders if any locks are held
+resourcelock coordinator --restart --force   # revokes held locks, stops the daemon and starts a fresh one
+```
 
 ---
 

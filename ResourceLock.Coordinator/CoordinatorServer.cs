@@ -65,6 +65,13 @@ public sealed class CoordinatorServer : IAsyncDisposable
     }
 
     public CoordinatorStats Stats => _stats;
+    private readonly TaskCompletionSource _shutdownRequestedTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    /// <summary>Completes when a client sends an IPC Shutdown request (graceful restart).</summary>
+    public Task ShutdownRequested => _shutdownRequestedTcs.Task;
+
+    internal void RequestShutdown() => _shutdownRequestedTcs.TrySetResult();
+
     public string PipeOrSocketName => _pipeOrSocketName;
     public int? HttpPort { get; private set; }
     public Uri? HttpUri { get; private set; }
@@ -201,7 +208,7 @@ public sealed class CoordinatorServer : IAsyncDisposable
                     {
                         await using (stream.ConfigureAwait(false))
                         {
-                            var handler = new IpcConnectionHandler(_lockEngine, _remoteCoordinatorClient, _stats);
+                            var handler = new IpcConnectionHandler(_lockEngine, _remoteCoordinatorClient, _stats, RequestShutdown);
                             await handler.HandleAsync(stream, cancellationToken).ConfigureAwait(false);
                         }
                     }
@@ -284,7 +291,7 @@ public sealed class CoordinatorServer : IAsyncDisposable
                         using (clientSocket)
                         await using (var stream = new NetworkStream(clientSocket, ownsSocket: false))
                         {
-                            var handler = new IpcConnectionHandler(_lockEngine, _remoteCoordinatorClient, _stats);
+                            var handler = new IpcConnectionHandler(_lockEngine, _remoteCoordinatorClient, _stats, RequestShutdown);
                             await handler.HandleAsync(stream, cancellationToken).ConfigureAwait(false);
                         }
                     }

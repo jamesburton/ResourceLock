@@ -208,6 +208,39 @@ public class McpToolsTests
     }
 
     [Fact]
+    public async Task IpcLockEngine_ReconnectsAfterCoordinatorRestart_AndReportsLostLocks()
+    {
+        var pipeName = OperatingSystem.IsWindows() ? "test-reconn-pipe-" + Guid.NewGuid().ToString("N") : Path.Combine(Path.GetTempPath(), $"rl-reconn-{Guid.NewGuid():N}.sock");
+        var server1 = new CoordinatorServer(new InMemoryLockEngine(), httpPort: -1, customPipeOrSocketName: pipeName);
+        await server1.StartAsync();
+
+        var stream = await DaemonSpawner.TryConnectAsync(pipeName, 2000, CancellationToken.None);
+        Assert.NotNull(stream);
+        await using var ipcEngine = new IpcLockEngine(
+            stream,
+            async ct => await DaemonSpawner.TryConnectAsync(pipeName, 2000, ct) ?? throw new IOException("no coordinator"),
+            "sess-reconn", 1234);
+        await ipcEngine.RegisterSessionAsync("sess-reconn", 1234);
+
+        var tools = new ResourceLockTools(ipcEngine, sessionId: "sess-reconn", ownerPid: 1234);
+        Assert.True((await tools.AcquireLockAsync("CPU")).Success);
+
+        // Restart the coordinator: old state and connections are gone.
+        await server1.DisposeAsync();
+        await using var server2 = new CoordinatorServer(new InMemoryLockEngine(), httpPort: -1, customPipeOrSocketName: pipeName);
+        await server2.StartAsync();
+
+        var list = await tools.ListLocksAsync();
+        Assert.Empty(list);
+
+        var acq = await tools.AcquireLockAsync("CPU");
+        Assert.True(acq.Success);
+        Assert.Contains("released", acq.Message ?? "", StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("CPU", acq.Message ?? "");
+        Assert.Single(await tools.ListLocksAsync());
+    }
+
+    [Fact]
     public async Task SubagentOwners_ShareSingleMcpToolsInstance_BlockAndReleaseIndependently()
     {
         var engine = new InMemoryLockEngine();

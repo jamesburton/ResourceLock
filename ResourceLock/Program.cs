@@ -109,7 +109,9 @@ Options:
             }
         }
 
-        await using var ipcEngine = new IpcLockEngine(stream);
+        await using var ipcEngine = customIpcStream != null
+            ? new IpcLockEngine(stream)
+            : new IpcLockEngine(stream, ct => DaemonSpawner.EnsureCoordinatorAndConnectAsync(ct), sessionId, pid);
         await ipcEngine.RegisterSessionAsync(sessionId, pid, cancellationToken).ConfigureAwait(false);
 
         var tools = new ResourceLockTools(ipcEngine, sessionId, pid);

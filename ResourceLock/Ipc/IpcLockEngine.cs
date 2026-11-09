@@ -4,6 +4,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
@@ -17,7 +18,14 @@ using ResourceLock.Core.Models;
 /// </summary>
 public sealed class IpcLockEngine : ILockEngine, IDisposable, IAsyncDisposable
 {
-    private readonly Stream _stream;
+    private Stream _stream;
+    private readonly Func<CancellationToken, Task<Stream>>? _connect;
+    private readonly string? _sessionId;
+    private readonly int _ownerPid;
+    private readonly SemaphoreSlim _reconnectGate = new(1, 1);
+    private readonly ConcurrentDictionary<(string Resource, string SessionId), byte> _held = new();
+    private string? _pendingNotice;
+    private int _generation;
     private readonly SemaphoreSlim _writeGate = new(1, 1);
     private readonly ConcurrentDictionary<string, TaskCompletionSource<IpcEnvelope?>> _pendingRequests = new(StringComparer.Ordinal);
     private readonly CancellationTokenSource _disposeCts = new();
@@ -28,6 +36,86 @@ public sealed class IpcLockEngine : ILockEngine, IDisposable, IAsyncDisposable
     public IpcLockEngine(Stream stream)
     {
         _stream = stream ?? throw new ArgumentNullException(nameof(stream));
+    }
+
+    /// <summary>
+    /// Creates an engine that transparently reconnects (via <paramref name="connect"/>, which should also
+    /// re-spawn the coordinator if needed) when the coordinator connection breaks, e.g. after a daemon restart.
+    /// </summary>
+    public IpcLockEngine(Stream stream, Func<CancellationToken, Task<Stream>> connect, string sessionId, int ownerPid)
+        : this(stream)
+    {
+        _connect = connect ?? throw new ArgumentNullException(nameof(connect));
+        _sessionId = sessionId;
+        _ownerPid = ownerPid;
+    }
+
+    private async Task ReconnectAsync(int failedGeneration, CancellationToken cancellationToken)
+    {
+        await _reconnectGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (_generation != failedGeneration) return; // another caller already reconnected
+
+            Task? oldReader;
+            lock (_readerSync) { oldReader = _readerTask; }
+            try { _stream.Dispose(); } catch { }
+            if (oldReader != null)
+            {
+                try { await oldReader.ConfigureAwait(false); } catch { }
+            }
+
+            var delay = 100;
+            Exception? last = null;
+            for (var attempt = 0; attempt < 5; attempt++)
+            {
+                try
+                {
+                    var stream = await _connect!(cancellationToken).ConfigureAwait(false);
+                    lock (_readerSync)
+                    {
+                        _stream = stream;
+                        _readerTask = null;
+                    }
+                    Interlocked.Increment(ref _generation);
+                    if (_sessionId != null)
+                    {
+                        var payload = JsonSerializer.Serialize(new SessionInfo(_sessionId, _ownerPid, DateTimeOffset.UtcNow), IpcFrameCodec.DefaultJsonOptions);
+                        await SendOnceAsync(new IpcEnvelope(Guid.NewGuid().ToString("N"), IpcMessageType.RegisterSession, payload), cancellationToken).ConfigureAwait(false);
+                    }
+
+                    var lost = _held.Keys.Select(k => k.Resource).Distinct(StringComparer.Ordinal).ToArray();
+                    _held.Clear();
+                    if (lost.Length > 0)
+                    {
+                        _pendingNotice = $"Coordinator connection was lost and re-established (coordinator restarted); locks previously held by this session were released: {string.Join(", ", lost)}.";
+                    }
+                    return;
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    last = ex;
+                    await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+                    delay = Math.Min(delay * 2, 1000);
+                }
+            }
+
+            throw new IOException($"Coordinator connection lost and reconnect failed: {last?.Message}", last);
+        }
+        finally
+        {
+            _reconnectGate.Release();
+        }
+    }
+
+    private LockResult WithNotice(LockResult result)
+    {
+        var notice = Interlocked.Exchange(ref _pendingNotice, null);
+        return notice == null ? result : result with { Message = string.IsNullOrEmpty(result.Message) ? notice : notice + " " + result.Message };
     }
 
     private void EnsureReaderStarted()
@@ -74,6 +162,30 @@ public sealed class IpcLockEngine : ILockEngine, IDisposable, IAsyncDisposable
     }
 
     private async Task<IpcEnvelope?> SendRequestAsync(IpcEnvelope envelope, CancellationToken cancellationToken)
+    {
+        if (_connect == null)
+        {
+            return await SendOnceAsync(envelope, cancellationToken).ConfigureAwait(false);
+        }
+
+        var generation = _generation;
+        try
+        {
+            var response = await SendOnceAsync(envelope, cancellationToken).ConfigureAwait(false);
+            if (response != null) return response;
+        }
+        catch (Exception ex) when (ex is IOException or ObjectDisposedException or InvalidOperationException)
+        {
+        }
+
+        if (_disposed) return null;
+        await ReconnectAsync(generation, cancellationToken).ConfigureAwait(false);
+        // Retry once on the fresh connection (new id avoids stale correlation).
+        var retry = envelope with { MessageId = Guid.NewGuid().ToString("N") };
+        return await SendOnceAsync(retry, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task<IpcEnvelope?> SendOnceAsync(IpcEnvelope envelope, CancellationToken cancellationToken)
     {
         EnsureReaderStarted();
 
@@ -124,10 +236,14 @@ public sealed class IpcLockEngine : ILockEngine, IDisposable, IAsyncDisposable
         if (response?.PayloadJson != null)
         {
             var result = JsonSerializer.Deserialize<LockResult>(response.PayloadJson, IpcFrameCodec.DefaultJsonOptions);
-            if (result != null) return result;
+            if (result != null)
+            {
+                if (result.Success) _held[(request.Resource, request.SessionId)] = 0;
+                return WithNotice(result);
+            }
         }
 
-        return new LockResult(false, request.Resource, request.SessionId, request.OwnerPid, "No response from coordinator", null);
+        return WithNotice(new LockResult(false, request.Resource, request.SessionId, request.OwnerPid, "No response from coordinator", null));
     }
 
     public async ValueTask<LockResult> ReleaseAsync(string resource, string sessionId, CancellationToken cancellationToken = default)
@@ -141,10 +257,14 @@ public sealed class IpcLockEngine : ILockEngine, IDisposable, IAsyncDisposable
         if (response?.PayloadJson != null)
         {
             var result = JsonSerializer.Deserialize<LockResult>(response.PayloadJson, IpcFrameCodec.DefaultJsonOptions);
-            if (result != null) return result;
+            if (result != null)
+            {
+                _held.TryRemove((resource, sessionId), out _);
+                return WithNotice(result);
+            }
         }
 
-        return new LockResult(false, resource, sessionId, null, "No response from coordinator", null);
+        return WithNotice(new LockResult(false, resource, sessionId, null, "No response from coordinator", null));
     }
 
     public async ValueTask<int> ReleaseAllForSessionAsync(string sessionId, CancellationToken cancellationToken = default)
@@ -154,6 +274,7 @@ public sealed class IpcLockEngine : ILockEngine, IDisposable, IAsyncDisposable
         var envelope = new IpcEnvelope(msgId, IpcMessageType.ReleaseAll, payload);
 
         var response = await SendRequestAsync(envelope, cancellationToken).ConfigureAwait(false);
+        foreach (var key in _held.Keys.Where(k => k.SessionId == sessionId)) _held.TryRemove(key, out _);
         if (response?.PayloadJson != null)
         {
             using var doc = JsonDocument.Parse(response.PayloadJson);

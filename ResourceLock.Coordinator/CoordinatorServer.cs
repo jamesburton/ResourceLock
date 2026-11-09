@@ -30,6 +30,8 @@ public sealed class CoordinatorServer : IAsyncDisposable
     private readonly ConcurrentDictionary<Task, bool> _activeConnections = new();
     private readonly TaskCompletionSource _ipcReadyTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
+    private readonly CoordinatorStats _stats = new();
+
     private CancellationTokenSource? _cts;
     private Task? _ipcLoopTask;
     private WebApplication? _app;
@@ -62,6 +64,7 @@ public sealed class CoordinatorServer : IAsyncDisposable
         }
     }
 
+    public CoordinatorStats Stats => _stats;
     public string PipeOrSocketName => _pipeOrSocketName;
     public int? HttpPort { get; private set; }
     public Uri? HttpUri { get; private set; }
@@ -198,7 +201,7 @@ public sealed class CoordinatorServer : IAsyncDisposable
                     {
                         await using (stream.ConfigureAwait(false))
                         {
-                            var handler = new IpcConnectionHandler(_lockEngine, _remoteCoordinatorClient);
+                            var handler = new IpcConnectionHandler(_lockEngine, _remoteCoordinatorClient, _stats);
                             await handler.HandleAsync(stream, cancellationToken).ConfigureAwait(false);
                         }
                     }
@@ -281,7 +284,7 @@ public sealed class CoordinatorServer : IAsyncDisposable
                         using (clientSocket)
                         await using (var stream = new NetworkStream(clientSocket, ownsSocket: false))
                         {
-                            var handler = new IpcConnectionHandler(_lockEngine, _remoteCoordinatorClient);
+                            var handler = new IpcConnectionHandler(_lockEngine, _remoteCoordinatorClient, _stats);
                             await handler.HandleAsync(stream, cancellationToken).ConfigureAwait(false);
                         }
                     }

@@ -19,9 +19,14 @@ public sealed class IpcConnectionHandler
 {
     private readonly ILockEngine _lockEngine;
     private readonly IRemoteCoordinatorClient _remoteCoordinatorClient;
+    private readonly CoordinatorStats _stats;
 
-    public IpcConnectionHandler(ILockEngine lockEngine, IRemoteCoordinatorClient? remoteCoordinatorClient = null)
+    public IpcConnectionHandler(
+        ILockEngine lockEngine,
+        IRemoteCoordinatorClient? remoteCoordinatorClient = null,
+        CoordinatorStats? stats = null)
     {
+        _stats = stats ?? new CoordinatorStats();
         _lockEngine = lockEngine ?? throw new ArgumentNullException(nameof(lockEngine));
         _remoteCoordinatorClient = remoteCoordinatorClient ?? new RemoteCoordinatorClient();
     }
@@ -40,6 +45,7 @@ public sealed class IpcConnectionHandler
         ArgumentNullException.ThrowIfNull(stream);
 
         var context = new ConnectionContext();
+        _stats.ClientConnected();
         using var writeGate = new SemaphoreSlim(1, 1);
         var inFlightTasks = new ConcurrentDictionary<Task, byte>();
 
@@ -89,6 +95,7 @@ public sealed class IpcConnectionHandler
         }
         finally
         {
+            _stats.ClientDisconnected();
             var pending = inFlightTasks.Keys.ToArray();
             if (pending.Length > 0)
             {
@@ -391,6 +398,23 @@ public sealed class IpcConnectionHandler
                     envelope.MessageId,
                     IpcMessageType.Response,
                     JsonSerializer.Serialize(new { status = "pong" }, IpcFrameCodec.DefaultJsonOptions));
+                await WriteFrameSafeAsync(stream, writeGate, resp, cancellationToken).ConfigureAwait(false);
+                break;
+            }
+
+            case IpcMessageType.Status:
+            {
+                var locks = await _lockEngine.ListLocksAsync(cancellationToken).ConfigureAwait(false);
+                var status = new CoordinatorStatus(
+                    Environment.ProcessId,
+                    _stats.StartedAt,
+                    _stats.ConnectedClients,
+                    locks.Count,
+                    typeof(IpcConnectionHandler).Assembly.GetName().Version?.ToString() ?? "unknown");
+                var resp = new IpcEnvelope(
+                    envelope.MessageId,
+                    IpcMessageType.Response,
+                    JsonSerializer.Serialize(status, IpcFrameCodec.DefaultJsonOptions));
                 await WriteFrameSafeAsync(stream, writeGate, resp, cancellationToken).ConfigureAwait(false);
                 break;
             }

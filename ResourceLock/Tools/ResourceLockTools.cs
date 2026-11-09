@@ -117,6 +117,21 @@ public class ResourceLockTools
     }
 
     /// <summary>
+    /// Returns coordinator health (pid, start time, connected clients, held lock count, version) without taking a lock.
+    /// </summary>
+    [Description("Returns coordinator health: pid, start time, connected clients, held lock count and version. Does not take a lock.")]
+    public async Task<CoordinatorStatus?> GetCoordinatorStatusAsync(CancellationToken cancellationToken = default)
+    {
+        if (_engine is ResourceLock.Ipc.IpcLockEngine ipc)
+        {
+            return await ipc.GetStatusAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        var locks = await _engine.ListLocksAsync(cancellationToken).ConfigureAwait(false);
+        return new CoordinatorStatus(Environment.ProcessId, DateTimeOffset.MinValue, 0, locks.Count, "in-process");
+    }
+
+    /// <summary>
     /// Releases all locks currently held by this session (or subagent owner).
     /// </summary>
     [Description("Releases all locks currently held by this session.")]
@@ -173,6 +188,10 @@ public class ResourceLockTools
     public Task<IReadOnlyList<LockRecord>> list_locks()
         => ListLocksAsync();
 
+    [Description("Returns coordinator health: pid, start time, connected clients, held lock count and version. Does not take a lock.")]
+    public Task<CoordinatorStatus?> coordinator_status()
+        => GetCoordinatorStatusAsync();
+
     [Description("Releases all locks currently held by this session.")]
     public Task<ReleaseAllResult> release_all_locks(string? owner = null)
         => ReleaseAllLocksAsync(owner);
@@ -185,6 +204,7 @@ public class ResourceLockTools
         yield return AIFunctionFactory.Create(acquire_lock, name: "acquire_lock", description: "Acquires an exclusive lock on a specified resource (e.g., 'CPU', 'GPU', 'NPU', 'Strix:CPU').");
         yield return AIFunctionFactory.Create(release_lock, name: "release_lock", description: "Releases a previously acquired lock on a resource held by the current session.");
         yield return AIFunctionFactory.Create(list_locks, name: "list_locks", description: "Lists all currently held locks across the system with their owner session, PID, acquisition time, and reason.");
+        yield return AIFunctionFactory.Create(coordinator_status, name: "coordinator_status", description: "Returns coordinator health: pid, start time, connected clients, held lock count and version. Does not take a lock.");
         yield return AIFunctionFactory.Create(release_all_locks, name: "release_all_locks", description: "Releases all locks currently held by this session. Recommended before finishing work.");
     }
 }

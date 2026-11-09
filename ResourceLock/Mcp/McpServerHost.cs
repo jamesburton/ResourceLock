@@ -384,6 +384,16 @@ public sealed class McpServerHost
             },
             new
             {
+                name = "coordinator_status",
+                description = "Returns coordinator health: pid, start time, connected clients, held lock count and version. Does not take a lock.",
+                inputSchema = new
+                {
+                    type = "object",
+                    properties = new Dictionary<string, object>()
+                }
+            },
+            new
+            {
                 name = "release_all_locks",
                 description = "Releases all locks currently held by this session. Recommended before finishing work.",
                 inputSchema = new
@@ -521,6 +531,27 @@ public sealed class McpServerHost
                         expires_at = l.ExpiresAt,
                         reason = l.Reason
                     });
+
+                    return CreateToolSuccessResponse(id, payload);
+                }
+
+                case "coordinator_status":
+                {
+                    var status = await _tools.GetCoordinatorStatusAsync(cancellationToken).ConfigureAwait(false);
+                    if (status == null)
+                    {
+                        return CreateToolSuccessResponse(id, new { running = false, message = "No response from coordinator." });
+                    }
+
+                    var payload = new
+                    {
+                        running = true,
+                        pid = status.Pid,
+                        started_at = status.StartedAt,
+                        connected_clients = status.ConnectedClients,
+                        held_locks = status.HeldLocks,
+                        version = status.Version
+                    };
 
                     return CreateToolSuccessResponse(id, payload);
                 }

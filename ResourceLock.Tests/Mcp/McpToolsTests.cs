@@ -138,7 +138,7 @@ public class McpToolsTests
         using var listDoc = JsonDocument.Parse(outputLines[2]);
         Assert.Equal(3, listDoc.RootElement.GetProperty("id").GetInt32());
         var toolsArray = listDoc.RootElement.GetProperty("result").GetProperty("tools");
-        Assert.Equal(4, toolsArray.GetArrayLength());
+        Assert.Equal(5, toolsArray.GetArrayLength());
 
         // Check ID 4 (acquire_lock)
         using var acqDoc = JsonDocument.Parse(outputLines[3]);
@@ -161,7 +161,7 @@ public class McpToolsTests
         var tools = new ResourceLockTools(engine, sessionId: "sess-ai", ownerPid: 9876);
         var functions = tools.AsAIFunctions().ToList();
 
-        Assert.Equal(4, functions.Count);
+        Assert.Equal(5, functions.Count);
 
         var acqFunc = functions.First(f => f.Name == "acquire_lock");
         var raw = await acqFunc.InvokeAsync(new AIFunctionArguments { ["resource"] = "GPU" });

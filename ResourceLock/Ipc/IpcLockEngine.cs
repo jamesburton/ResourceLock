@@ -303,6 +303,18 @@ public sealed class IpcLockEngine : ILockEngine, IDisposable, IAsyncDisposable
         return Array.Empty<LockRecord>();
     }
 
+    public async Task<CoordinatorStatus?> GetStatusAsync(CancellationToken cancellationToken = default)
+    {
+        var envelope = new IpcEnvelope(Guid.NewGuid().ToString("N"), IpcMessageType.Status);
+        var response = await SendRequestAsync(envelope, cancellationToken).ConfigureAwait(false);
+        if (response?.PayloadJson != null)
+        {
+            return JsonSerializer.Deserialize<CoordinatorStatus>(response.PayloadJson, IpcFrameCodec.DefaultJsonOptions);
+        }
+
+        return null;
+    }
+
     public ValueTask<bool> EvictDeadPidAsync(int pid, CancellationToken cancellationToken = default)
     {
         return ValueTask.FromResult(false);

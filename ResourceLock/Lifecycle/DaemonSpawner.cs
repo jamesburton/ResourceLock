@@ -21,6 +21,10 @@ public static class DaemonSpawner
             cancellationToken: cancellationToken);
     }
 
+    /// <summary>Connects to an already-running coordinator without ever spawning one. Returns null if unreachable.</summary>
+    public static Task<Stream?> TryConnectExistingAsync(string? pipeOrSocketName = null, int timeoutMs = 500, CancellationToken cancellationToken = default)
+        => TryConnectAsync(ResolveEndpoint(pipeOrSocketName), timeoutMs, cancellationToken);
+
     public static async Task<Stream> EnsureCoordinatorAndConnectAsync(
         string? pipeOrSocketName,
         string? coordinatorExecutable = null,

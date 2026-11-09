@@ -30,6 +30,11 @@ public class Program
             return 0;
         }
 
+        if (args.Length > 0 && args[0].Equals("status", StringComparison.OrdinalIgnoreCase))
+        {
+            return await RunStatusAsync().ConfigureAwait(false);
+        }
+
         if (args.Length > 0 && args.Any(a => a.Equals("coordinator", StringComparison.OrdinalIgnoreCase)))
         {
             return await RunCoordinatorAsync(args).ConfigureAwait(false);
@@ -45,14 +50,51 @@ public class Program
 Usage:
   resourcelock [options]
   resourcelock coordinator [options]
+  resourcelock status
 
 Commands:
   coordinator        Run in standalone coordinator daemon mode
+  status             Show coordinator health (pid, start time, clients, held locks); exit 1 if not running
 
 Options:
   -h, --help         Show help and usage information
   -v, --version      Show version information
 ");
+    }
+
+    public static async Task<int> RunStatusAsync(string? pipeOrSocketName = null, TextWriter? output = null)
+    {
+        output ??= Console.Out;
+        var stream = await DaemonSpawner.TryConnectExistingAsync(pipeOrSocketName).ConfigureAwait(false);
+        if (stream == null)
+        {
+            await output.WriteLineAsync("coordinator not running").ConfigureAwait(false);
+            return 1;
+        }
+
+        await using var engine = new IpcLockEngine(stream);
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        try
+        {
+            var status = await engine.GetStatusAsync(cts.Token).ConfigureAwait(false);
+            if (status == null)
+            {
+                await output.WriteLineAsync("coordinator not running").ConfigureAwait(false);
+                return 1;
+            }
+
+            await output.WriteLineAsync($"pid:               {status.Pid}").ConfigureAwait(false);
+            await output.WriteLineAsync($"started:           {status.StartedAt:u}").ConfigureAwait(false);
+            await output.WriteLineAsync($"connected clients: {status.ConnectedClients}").ConfigureAwait(false);
+            await output.WriteLineAsync($"held locks:        {status.HeldLocks}").ConfigureAwait(false);
+            await output.WriteLineAsync($"version:           {status.Version}").ConfigureAwait(false);
+            return 0;
+        }
+        catch (OperationCanceledException)
+        {
+            await output.WriteLineAsync("coordinator not responding").ConfigureAwait(false);
+            return 1;
+        }
     }
 
     public static async Task<int> RunCoordinatorAsync(string[] args, CancellationToken cancellationToken = default)

@@ -11,7 +11,8 @@ public enum IpcMessageType
     ReleaseAll,
     List,
     Response,
-    Ping
+    Ping,
+    Status
 }
 
 public sealed record IpcEnvelope(
